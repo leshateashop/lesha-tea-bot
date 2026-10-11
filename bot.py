@@ -1,393 +1,350 @@
 import asyncio
+import csv
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from pathlib import Path
+from html import escape
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-)
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "tea_shop.db")
+CATALOG_PATH = os.getenv("CATALOG_PATH", "catalog.csv")
 
 logging.basicConfig(level=logging.INFO)
-
 dp = Dispatcher()
 
-CATEGORIES = [
-    ("pu_er_shu", "🍂 Шу пуэр"),
-    ("pu_er_sheng", "🌿 Шэн пуэр"),
-    ("oolong", "🪨 Улуны"),
-    ("red", "🔴 Красный чай"),
-    ("gaba", "🌱 Габа"),
-    ("white", "🤍 Белый чай"),
-    ("sets", "🎁 Наборы"),
-]
+# Кнопки категорий сопоставлены с названиями категорий в общем каталоге.
+CATEGORY_ALIASES = {
+    "Шу пуэр": ["шу пуэр", "шу"],
+    "Шэн пуэр": ["шэн пуэр", "шен пуэр", "шэн"],
+    "Улуны": ["улун", "улуны"],
+    "Красный чай": ["красный чай"],
+    "Габа": ["габа"],
+    "Белый чай": ["белый чай"],
+    "Наборы": ["набор"],
+    "Порционный чай": ["порционный чай"],
+    "Зелёный чай": ["зелёный чай", "зеленый чай"],
+    "Посуда": ["посуда"],
+}
 
-# Товары добавлены вручную по публичному каталогу сайта.
-# Автоматический сбор данных с сайта не используется.
-SITE_PRODUCTS = [
-    ("pu_er_shu", "Феникс", "Шу пуэр, прессованный блинчик.", 2250, "357 г"),
-    ("pu_er_shu", "Сталин", "Шу пуэр.", 500, "100 г"),
-    ("pu_er_shu", "Сокровище", "Шу пуэр.", 2800, "400 г"),
-    ("pu_er_shu", "Смола Шу", "Чайная смола Шу.", 350, "10 шт."),
-    ("oolong", "ФХДЦ А", "Фэн Хуан Дань Цун Милань Сян А.", 1750, "100 г"),
-    ("oolong", "Те Гуань Инь Хуа Сян", "Цветочный аромат.", 1150, "100 г"),
-    ("oolong", "Те Гуань Инь Го Сян", "Фруктовый аромат.", 850, "100 г"),
-    ("oolong", "Те Гуань Инь вакуум", "Порционные упаковки.", 1600, "10 шт. по 7 г"),
-    ("red", "Ф.М. Достоевский", "Большие золотые иглы — красный чай. Серия «Великий писатель».", 1700, "200 г"),
-    ("red", "Сун Чжен", "Красный чай «Сосновые иглы».", 800, "100 г"),
-    ("gaba", "Сапфир", "Габа, Тайвань.", 2000, "100 г"),
-    ("gaba", 'Габа "Тень"', "Габа, Тайвань.", 1250, "50 г"),
-    ("gaba", 'Габа улун "Сова"', "Габа пресс.", 1500, "100 г"),
-    ("white", "Л.Н. Толстой", "Мао Фэн.", 1250, "200 г"),
-]
+MAIN_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🍃 Выбрать чай"), KeyboardButton(text="🛒 Корзина")],
+        [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="👤 Профиль")],
+        [KeyboardButton(text="📦 Мои заказы"), KeyboardButton(text="🎁 Бонусы")],
+        [KeyboardButton(text="💬 Поддержка")],
+    ],
+    resize_keyboard=True,
+)
 
+def norm(value):
+    return " ".join(str(value or "").strip().lower().replace("ё", "е").split())
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def get_col(row, *names):
+    normalized = {norm(k): v for k, v in row.items() if k is not None}
+    for name in names:
+        if norm(name) in normalized:
+            return (normalized[norm(name)] or "").strip()
+    return ""
 
+def load_catalog():
+    path = Path(CATALOG_PATH)
+    if not path.exists():
+        logging.warning("Каталог не найден: %s", path.resolve())
+        return []
+
+    # Excel CSV обычно сохраняется либо в UTF-8, либо в UTF-8 с BOM.
+    for encoding in ("utf-8-sig", "cp1251"):
+        try:
+            with path.open("r", encoding=encoding, newline="") as f:
+                sample = f.read(4096)
+                f.seek(0)
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=",;\\t")
+                except csv.Error:
+                    dialect = csv.excel
+                reader = csv.DictReader(f, dialect=dialect)
+                products = []
+                for index, row in enumerate(reader, start=1):
+                    name = get_col(row, "name", "Название", "Наименование")
+                    if not name:
+                        continue
+                    category = get_col(row, "category", "Категория")
+                    price_raw = get_col(row, "price", "Цена ₽", "Цена", "Стоимость")
+                    weight = get_col(row, "weight", "Вес", "Фасовка")
+                    available_raw = get_col(row, "available", "Наличие", "В наличии")
+                    show_raw = get_col(row, "show", "Показывать в боте", "Показывать")
+                    description = get_col(row, "description", "Описание")
+                    photo = get_col(row, "photo", "Фото", "image", "image_url")
+                    product_id = get_col(row, "id", "ID", "Артикул") or str(index)
+
+                    try:
+                        price = int(float(price_raw.replace("₽", "").replace(" ", "").replace(",", ".")))
+                    except (ValueError, AttributeError):
+                        price = 0
+
+                    available = norm(available_raw) in {"есть", "да", "1", "true", "в наличии", "yes", "available"}
+                    show = norm(show_raw) in {"да", "есть", "1", "true", "yes", "показывать"}
+                    # Если в файле нет столбца показа, товар показываем по умолчанию.
+                    if not show_raw:
+                        show = True
+
+                    if show and price > 0:
+                        products.append({
+                            "id": product_id,
+                            "category": category,
+                            "name": name,
+                            "price": price,
+                            "weight": weight,
+                            "available": available,
+                            "description": description,
+                            "photo": photo,
+                        })
+                logging.info("Загружено товаров из каталога: %s", len(products))
+                return products
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            logging.exception("Не удалось прочитать каталог %s", path.resolve())
+            return []
+    logging.error("Не удалось определить кодировку catalog.csv")
+    return []
 
 def init_db():
-    conn = db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            telegram_id INTEGER PRIMARY KEY,
-            name TEXT,
-            username TEXT,
-            phone TEXT,
-            address TEXT,
-            bonus_balance INTEGER DEFAULT 0,
-            spent INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL,
-            name TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            price INTEGER NOT NULL,
-            weight TEXT DEFAULT '50 г',
-            photo_id TEXT,
-            active INTEGER DEFAULT 1
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS cart (
-            user_id INTEGER NOT NULL,
-            product_id INTEGER NOT NULL,
-            quantity INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY (user_id, product_id)
-        )
-    """)
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS cart (
+                user_id INTEGER NOT NULL,
+                product_id TEXT NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (user_id, product_id)
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT
+            )
+        """)
 
-    for category, name, description, price, weight in SITE_PRODUCTS:
-        exists = conn.execute(
-            "SELECT id FROM products WHERE name=? AND category=? LIMIT 1",
-            (name, category),
-        ).fetchone()
-
-        if not exists:
-            conn.execute("""
-                INSERT INTO products
-                (category, name, description, price, weight, active)
-                VALUES (?, ?, ?, ?, ?, 1)
-            """, (category, name, description, price, weight))
-
-    conn.commit()
-    conn.close()
-
-
-def register_user(message: Message):
-    user = message.from_user
-    conn = db()
-    conn.execute("""
-        INSERT INTO users (telegram_id, name, username, created_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(telegram_id) DO UPDATE SET
-            name=excluded.name,
-            username=excluded.username
-    """, (
-        user.id,
-        user.full_name,
-        user.username or "",
-        datetime.now().isoformat(timespec="seconds"),
-    ))
-    conn.commit()
-    conn.close()
-
-
-def main_menu():
-    builder = ReplyKeyboardBuilder()
-    builder.button(text="🍃 Выбрать чай")
-    builder.button(text="🛒 Корзина")
-    builder.button(text="❤️ Избранное")
-    builder.button(text="👤 Профиль")
-    builder.button(text="📦 Мои заказы")
-    builder.button(text="🎁 Бонусы")
-    builder.button(text="💬 Поддержка")
-    builder.adjust(2, 2, 2, 1)
-    return builder.as_markup(resize_keyboard=True)
-
+def products_for_category(category):
+    products = load_catalog()
+    aliases = CATEGORY_ALIASES.get(category, [norm(category)])
+    return [
+        p for p in products
+        if any(alias in norm(p["category"]) for alias in aliases)
+    ]
 
 def category_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=title, callback_data=f"cat:{key}")]
-        for key, title in CATEGORIES
-    ])
+    builder = InlineKeyboardBuilder()
+    for category in CATEGORY_ALIASES:
+        builder.button(text=category, callback_data=f"cat:{category}")
+    builder.adjust(2)
+    return builder.as_markup()
 
+def product_keyboard(product):
+    builder = InlineKeyboardBuilder()
+    if product["available"]:
+        builder.button(text="🛒 В корзину", callback_data=f"add:{product['id']}")
+    else:
+        builder.button(text="Нет в наличии", callback_data="unavailable")
+    builder.button(text="⬅️ К категориям", callback_data="categories")
+    builder.adjust(1)
+    return builder.as_markup()
 
-def back_to_categories_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Все категории", callback_data="back:categories")]
-    ])
+def format_product(product):
+    text = f"<b>{escape(product['name'])}</b>\n"
+    if product["weight"]:
+        text += f"Вес: {escape(product['weight'])}\n"
+    text += f"Цена: <b>{product['price']} ₽</b>\n"
+    text += "Наличие: " + ("есть" if product["available"] else "нет") 
+    if product["description"]:
+        text += f"\n\n{escape(product['description'])}"
+    return text
 
+def all_visible_products():
+    return load_catalog()
 
-@dp.message(Command("start"))
+def find_product(product_id):
+    for p in all_visible_products():
+        if str(p["id"]) == str(product_id):
+            return p
+    return None
+
+@dp.message(CommandStart())
 async def start(message: Message):
-    register_user(message)
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT OR REPLACE INTO users(user_id, username, first_name) VALUES (?, ?, ?)",
+            (message.from_user.id, message.from_user.username, message.from_user.first_name),
+        )
     await message.answer(
-        "🍵 <b>Чайная лавка дяди Лёши</b>\n\n"
-        "Китайский чай без лишнего пафоса.\n\n"
+        "🍵 <b>Чайная лавка дяди Лёши</b>\n"
+        "Китайский чай без лишнего пафоса.\n"
         "Выбирай чай, собирай корзину и оформляй заказ прямо здесь.",
-        reply_markup=main_menu(),
+        reply_markup=MAIN_MENU,
         parse_mode="HTML",
     )
 
-
-@dp.message(Command("catalog"))
 @dp.message(F.text == "🍃 Выбрать чай")
-async def catalog(message: Message):
-    await message.answer(
-        "🍃 <b>Выберите категорию</b>",
-        reply_markup=category_keyboard(),
-        parse_mode="HTML",
-    )
+async def choose_tea(message: Message):
+    await message.answer("Выбери категорию:", reply_markup=category_keyboard())
 
-
-@dp.callback_query(F.data == "back:categories")
-async def back_categories(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "🍃 <b>Выберите категорию</b>",
-        reply_markup=category_keyboard(),
-        parse_mode="HTML",
-    )
+@dp.callback_query(F.data == "categories")
+async def back_to_categories(callback: CallbackQuery):
+    await callback.message.edit_text("Выбери категорию:", reply_markup=category_keyboard())
     await callback.answer()
 
-
 @dp.callback_query(F.data.startswith("cat:"))
-async def category(callback: CallbackQuery):
-    category_key = callback.data.split(":", 1)[1]
-    category_name = dict(CATEGORIES).get(category_key, "Чай")
-
-    conn = db()
-    products = conn.execute(
-        "SELECT * FROM products WHERE category=? AND active=1 ORDER BY id",
-        (category_key,),
-    ).fetchall()
-    conn.close()
-
+async def show_category(callback: CallbackQuery):
+    category = callback.data.split(":", 1)[1]
+    products = products_for_category(category)
     if not products:
         await callback.message.edit_text(
-            f"{category_name}\n\n"
-            "Пока здесь ничего нет. "
-            "Добавим товары из каталога сайта следующим этапом.",
+            f"В категории «{escape(category)}» пока нет товаров в каталоге.",
             reply_markup=category_keyboard(),
+            parse_mode="HTML",
         )
         await callback.answer()
         return
 
-    await callback.message.edit_text(
-        f"{category_name}\n\n<b>Выберите чай:</b>",
-        parse_mode="HTML",
-    )
-
+    builder = InlineKeyboardBuilder()
     for p in products:
-        text = (
-            f"<b>{p['name']}</b>\n"
-            f"{p['description']}\n\n"
-            f"⚖️ {p['weight']}\n"
-            f"💰 {p['price']:,} ₽".replace(",", " ")
+        status = "" if p["available"] else " — нет в наличии"
+        builder.button(
+            text=f"{p['name']} · {p['price']} ₽{status}"[:64],
+            callback_data=f"product:{p['id']}",
         )
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="🛒 Добавить в корзину",
-                callback_data=f"add:{p['id']}"
-            )]
-        ])
-
-        if p["photo_id"]:
-            await callback.message.answer_photo(
-                p["photo_id"],
-                caption=text,
-                reply_markup=kb,
-                parse_mode="HTML"
-            )
-        else:
-            await callback.message.answer(
-                text,
-                reply_markup=kb,
-                parse_mode="HTML"
-            )
-
-    await callback.message.answer(
-        "Выберите другую категорию:",
-        reply_markup=back_to_categories_keyboard()
+    builder.button(text="⬅️ К категориям", callback_data="categories")
+    builder.adjust(1)
+    await callback.message.edit_text(
+        f"<b>{escape(category)}</b>\nВыбери товар:",
+        reply_markup=builder.as_markup(),
+        parse_mode="HTML",
     )
     await callback.answer()
 
+@dp.callback_query(F.data.startswith("product:"))
+async def show_product(callback: CallbackQuery):
+    product_id = callback.data.split(":", 1)[1]
+    product = find_product(product_id)
+    if not product:
+        await callback.answer("Товар не найден в каталоге. Обнови список.", show_alert=True)
+        return
+    caption = format_product(product)
+    if product["photo"]:
+        try:
+            await callback.message.answer_photo(
+                photo=product["photo"],
+                caption=caption,
+                reply_markup=product_keyboard(product),
+                parse_mode="HTML",
+            )
+        except Exception:
+            await callback.message.answer(caption, reply_markup=product_keyboard(product), parse_mode="HTML")
+    else:
+        await callback.message.answer(caption, reply_markup=product_keyboard(product), parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data == "unavailable")
+async def unavailable(callback: CallbackQuery):
+    await callback.answer("Этого товара сейчас нет в наличии.", show_alert=True)
 
 @dp.callback_query(F.data.startswith("add:"))
 async def add_to_cart(callback: CallbackQuery):
-    product_id = int(callback.data.split(":", 1)[1])
-
-    conn = db()
-    product = conn.execute(
-        "SELECT name FROM products WHERE id=? AND active=1",
-        (product_id,)
-    ).fetchone()
-
-    if not product:
-        conn.close()
-        await callback.answer("Товар не найден", show_alert=True)
+    product_id = callback.data.split(":", 1)[1]
+    product = find_product(product_id)
+    if not product or not product["available"]:
+        await callback.answer("Товара сейчас нет в наличии.", show_alert=True)
         return
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("""
+            INSERT INTO cart(user_id, product_id, quantity) VALUES (?, ?, 1)
+            ON CONFLICT(user_id, product_id) DO UPDATE SET quantity = quantity + 1
+        """, (callback.from_user.id, product_id))
+    await callback.answer("Добавлено в корзину 🛒")
 
-    conn.execute("""
-        INSERT INTO cart (user_id, product_id, quantity)
-        VALUES (?, ?, 1)
-        ON CONFLICT(user_id, product_id)
-        DO UPDATE SET quantity = quantity + 1
-    """, (callback.from_user.id, product_id))
-    conn.commit()
-    conn.close()
-
-    await callback.answer(f"«{product['name']}» добавлен в корзину 🛒")
-
-
-@dp.message(Command("cart"))
 @dp.message(F.text == "🛒 Корзина")
-async def cart(message: Message):
-    conn = db()
-    rows = conn.execute("""
-        SELECT p.name, p.price, c.quantity
-        FROM cart c
-        JOIN products p ON p.id=c.product_id
-        WHERE c.user_id=? AND p.active=1
-    """, (message.from_user.id,)).fetchall()
-    conn.close()
-
+async def show_cart(message: Message):
+    with sqlite3.connect(DB_PATH) as con:
+        rows = con.execute(
+            "SELECT product_id, quantity FROM cart WHERE user_id = ?",
+            (message.from_user.id,),
+        ).fetchall()
     if not rows:
-        await message.answer(
-            "🛒 Корзина пока пустая.",
-            reply_markup=main_menu()
-        )
+        await message.answer("Корзина пока пуста. Нажми «🍃 Выбрать чай», чтобы добавить товары.")
         return
+    catalog = {str(p["id"]): p for p in all_visible_products()}
+    lines, total = [], 0
+    builder = InlineKeyboardBuilder()
+    for product_id, quantity in rows:
+        p = catalog.get(str(product_id))
+        if not p:
+            continue
+        subtotal = p["price"] * quantity
+        total += subtotal
+        lines.append(f"• {escape(p['name'])} × {quantity} — {subtotal} ₽")
+        builder.button(text=f"Убрать: {p['name']}"[:64], callback_data=f"remove:{product_id}")
+    builder.adjust(1)
+    lines.append(f"\n<b>Итого: {total} ₽</b>")
+    await message.answer("\n".join(lines), reply_markup=builder.as_markup(), parse_mode="HTML")
 
-    total = sum(r["price"] * r["quantity"] for r in rows)
-    lines = ["🛒 <b>Ваша корзина</b>\n"]
-
-    for r in rows:
-        amount = r["price"] * r["quantity"]
-        lines.append(
-            f"• {r['name']} × {r['quantity']} — {amount:,} ₽".replace(",", " ")
+@dp.callback_query(F.data.startswith("remove:"))
+async def remove_from_cart(callback: CallbackQuery):
+    product_id = callback.data.split(":", 1)[1]
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "DELETE FROM cart WHERE user_id = ? AND product_id = ?",
+            (callback.from_user.id, product_id),
         )
-
-    lines.append(f"\n<b>Итого: {total:,} ₽</b>".replace(",", " "))
-    lines.append("\nОформление заказа подключим следующим этапом.")
-
-    await message.answer(
-        "\n".join(lines),
-        reply_markup=main_menu(),
-        parse_mode="HTML"
-    )
-
-
-@dp.message(Command("profile"))
-@dp.message(F.text == "👤 Профиль")
-async def profile(message: Message):
-    register_user(message)
-    conn = db()
-    user = conn.execute(
-        "SELECT * FROM users WHERE telegram_id=?",
-        (message.from_user.id,)
-    ).fetchone()
-    conn.close()
-
-    await message.answer(
-        f"👤 <b>Ваш профиль</b>\n\n"
-        f"Имя: {user['name']}\n"
-        f"📱 Телефон: {user['phone'] or '—'}\n"
-        f"📍 Адрес: {user['address'] or '—'}\n"
-        f"🎁 Бонусный баланс: <b>{user['bonus_balance']} ₽</b>\n\n"
-        f"💳 <b>Накопительная карта</b>\n"
-        f"Уровень: 🌱 Новичок\n"
-        f"Кэшбэк: 5%\n"
-        f"Потрачено: {user['spent']:,} ₽".replace(",", " "),
-        reply_markup=main_menu(),
-        parse_mode="HTML",
-    )
-
-
-@dp.message(Command("orders"))
-@dp.message(F.text == "📦 Мои заказы")
-async def orders(message: Message):
-    await message.answer(
-        "📦 <b>Мои заказы</b>\n\n"
-        "История заказов появится здесь после подключения оформления заказа.",
-        reply_markup=main_menu(),
-        parse_mode="HTML",
-    )
-
-
-@dp.message(F.text == "🎁 Бонусы")
-async def bonuses(message: Message):
-    await message.answer(
-        "🎁 <b>Бонусная программа</b>\n\n"
-        "На первом этапе: 5% кэшбэка после получения заказа.\n"
-        "Позже добавим уровни, реферальную программу и персональные бонусы.",
-        reply_markup=main_menu(),
-        parse_mode="HTML",
-    )
-
+    await callback.answer("Убрано из корзины")
+    await callback.message.answer("Позиция удалена. Открой «🛒 Корзина», чтобы увидеть итог.")
 
 @dp.message(F.text == "❤️ Избранное")
 async def favorites(message: Message):
+    await message.answer("Избранное пока в разработке. Товары уже можно добавлять в корзину.")
+
+@dp.message(F.text == "👤 Профиль")
+async def profile(message: Message):
     await message.answer(
-        "❤️ Избранное пока пустое.\n\n"
-        "Эту функцию подключим вместе с каталогом.",
-        reply_markup=main_menu(),
+        f"👤 Ваш профиль\nTelegram ID: {message.from_user.id}\n"
+        "Если нужна помощь с заказом — нажми «💬 Поддержка»."
     )
 
+@dp.message(F.text == "📦 Мои заказы")
+async def orders(message: Message):
+    await message.answer("История заказов пока не подключена. Оформление заказа добавим следующим шагом.")
+
+@dp.message(F.text == "🎁 Бонусы")
+async def bonuses(message: Message):
+    await message.answer("Бонусная программа пока не подключена.")
 
 @dp.message(F.text == "💬 Поддержка")
 async def support(message: Message):
-    await message.answer(
-        "💬 <b>Поддержка</b>\n\n"
-        "Напишите сюда свой вопрос — на следующем этапе подключим связь с Лёшей.",
-        reply_markup=main_menu(),
-        parse_mode="HTML",
-    )
+    await message.answer("Напиши сюда свой вопрос — сообщение увидим в этом чате. Для быстрого заказа можно также написать в Telegram-магазин.")
 
+@dp.message(Command("catalog"))
+async def catalog_count(message: Message):
+    products = all_visible_products()
+    available = sum(1 for p in products if p["available"])
+    await message.answer(f"Каталог загружен: {len(products)} позиций, в наличии: {available}.")
+
+@dp.message()
+async def fallback(message: Message):
+    await message.answer("Выбери действие в меню ниже.", reply_markup=MAIN_MENU)
 
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "Не задан BOT_TOKEN. Добавьте его в переменные окружения."
-        )
-
+        raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
     init_db()
-    bot = Bot(BOT_TOKEN)
+    bot = Bot(token=BOT_TOKEN)
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
