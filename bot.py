@@ -15,7 +15,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "tea_shop.db")
 CATALOG_PATH = os.getenv("CATALOG_PATH", "catalog.csv")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "30838531").strip()
 
 logging.basicConfig(level=logging.INFO)
 dp = Dispatcher()
@@ -332,8 +332,8 @@ async def checkout_begin(callback: CallbackQuery):
         await callback.answer("Корзина пуста", show_alert=True)
         return
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("INSERT OR REPLACE INTO checkout_sessions(user_id, step, name, phone, delivery, address) VALUES (?, 'name', '', '', '', '')", (callback.from_user.id,))
-    await callback.message.answer("🧾 Оформление заказа\n\nКак к вам обращаться? Напишите имя.")
+        con.execute("INSERT OR REPLACE INTO checkout_sessions(user_id, step, name, phone, delivery, address) VALUES (?, 'details', ?, '', 'Уточнить по сообщению', '')", (callback.from_user.id, callback.from_user.full_name or callback.from_user.first_name or 'Покупатель'))
+    await callback.message.answer("🧾 <b>Оформление заказа</b>\n\nНапишите <b>одним сообщением</b> ваш телефон и данные доставки: город, адрес или пункт выдачи. Способ доставки тоже укажите, если уже знаете.\n\nИмя и Telegram мы добавим автоматически. Пример: +7 900 123-45-67, СДЭК, пункт выдачи в Москве — адрес уточню.", parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("delivery:"))
@@ -378,7 +378,18 @@ async def checkout_confirm(callback: CallbackQuery):
     await callback.message.answer(f"✅ <b>Заказ №{order_id} принят!</b>\n\n{item_lines}\n\n<b>Итого: {total} ₽</b>\nИмя: {escape(name)}\nТелефон: {escape(phone)}\nДоставка: {escape(delivery)}\nАдрес/пункт выдачи: {escape(address)}\n\nМы свяжемся с вами для подтверждения.", parse_mode="HTML", reply_markup=MAIN_MENU)
     if ADMIN_CHAT_ID:
         try:
-            await callback.bot.send_message(int(ADMIN_CHAT_ID), f"🛎 <b>Новый заказ №{order_id}</b>\n\n{item_lines}\n\n<b>Итого: {total} ₽</b>\nИмя: {escape(name)}\nТелефон: {escape(phone)}\nTelegram: @{escape(callback.from_user.username or 'нет')} (ID {user_id})\nДоставка: {escape(delivery)}\nАдрес/пункт выдачи: {escape(address)}", parse_mode="HTML")
+            username = callback.from_user.username
+            if username:
+                telegram_link = f"<a href=\"https://t.me/{escape(username)}\">@{escape(username)}</a>"
+            else:
+                telegram_link = f"<a href=\"tg://user?id={user_id}\">Открыть профиль покупателя</a>"
+            await callback.bot.send_message(
+                int(ADMIN_CHAT_ID),
+                f"🛎 <b>Новый заказ №{order_id}</b>\n\n{item_lines}\n\n<b>Итого: {total} ₽</b>\n"
+                f"Имя: {escape(name)}\nТелефон: {escape(phone)}\nTelegram: {telegram_link} (ID {user_id})\n"
+                f"Данные доставки: {escape(address)}\nСпособ доставки: {escape(delivery)}",
+                parse_mode="HTML", disable_web_page_preview=True
+            )
         except Exception:
             logging.exception("Не удалось отправить заказ владельцу")
     await callback.answer("Заказ оформлен")
@@ -388,55 +399,57 @@ async def checkout_text_step(message: Message):
     user_id = message.from_user.id
     text = (message.text or "").strip()
     if not text:
-        await message.answer("Пожалуйста, отправьте ответ текстом.")
+        await message.answer("Пожалуйста, отправьте данные текстом одним сообщением.")
         return
     with sqlite3.connect(DB_PATH) as con:
         row = con.execute("SELECT step, name, phone, delivery, address FROM checkout_sessions WHERE user_id = ?", (user_id,)).fetchone()
     if not row:
         return
     step, name, phone, delivery, address = row
+    if step != "details":
+        await message.answer("Оформление уже начато. Отправьте телефон и данные доставки одним сообщением или нажмите «Отменить».")
+        return
+
+    # Сохраняем весь ответ покупателя одним полем, чтобы ничего не потерять.
+    import re
+    phone_match = re.search(r"(?:\+?\d[\d()\-\s]{7,}\d)", text)
+    phone = phone_match.group(0).strip() if phone_match else "Не указан отдельно"
+    lowered = text.lower()
+    if "сдэк" in lowered or "cdek" in lowered:
+        delivery = "СДЭК"
+    elif "ozon" in lowered or "озон" in lowered:
+        delivery = "Ozon"
+    elif "курьер" in lowered:
+        delivery = "Курьер"
+    elif "самовывоз" in lowered:
+        delivery = "Самовывоз"
+    else:
+        delivery = "Уточнить по сообщению"
+    address = text[:1000]
     with sqlite3.connect(DB_PATH) as con:
-        if step == "name":
-            con.execute("UPDATE checkout_sessions SET name = ?, step = 'phone' WHERE user_id = ?", (text[:100], user_id))
-            response = "Теперь напишите номер телефона для связи."
-        elif step == "phone":
-            if len(text) < 5:
-                await message.answer("Похоже, номер слишком короткий. Напишите телефон ещё раз.")
-                return
-            con.execute("UPDATE checkout_sessions SET phone = ?, step = 'delivery' WHERE user_id = ?", (text[:50], user_id))
-            response = None
-        elif step == "address":
-            con.execute("UPDATE checkout_sessions SET address = ?, step = 'confirm' WHERE user_id = ?", (text[:500], user_id))
-            response = None
-        else:
-            return
-    if step == "phone":
-        builder = InlineKeyboardBuilder()
-        for label in ("СДЭК", "Ozon", "Курьер", "Самовывоз", "Согласуем отдельно"):
-            builder.button(text=label, callback_data=f"delivery:{label}")
-        builder.adjust(2)
-        await message.answer("Выберите способ доставки:", reply_markup=builder.as_markup())
-    elif step == "address":
-        with sqlite3.connect(DB_PATH) as con:
-            current = con.execute("SELECT name, phone, delivery, address FROM checkout_sessions WHERE user_id = ?", (user_id,)).fetchone()
-        name, phone, delivery, address = current
-        with sqlite3.connect(DB_PATH) as con:
-            cart_rows = con.execute("SELECT product_id, quantity FROM cart WHERE user_id = ?", (user_id,)).fetchall()
-        catalog = {str(p["id"]): p for p in all_visible_products()}
-        items, total = [], 0
-        for pid, qty in cart_rows:
-            product = catalog.get(str(pid))
-            if product:
-                subtotal = product["price"] * qty
-                total += subtotal
-                items.append(f"• {escape(product['name'])} × {qty} — {subtotal} ₽")
-        builder = InlineKeyboardBuilder()
-        builder.button(text="✅ Подтвердить заказ", callback_data="checkout:confirm")
-        builder.button(text="❌ Отменить", callback_data="checkout:cancel")
-        builder.adjust(1)
-        await message.answer(f"<b>Проверьте заказ</b>\n\n" + "\n".join(items) + f"\n\n<b>Итого: {total} ₽</b>\nИмя: {escape(name)}\nТелефон: {escape(phone)}\nДоставка: {escape(delivery)}\nАдрес: {escape(address)}", reply_markup=builder.as_markup(), parse_mode="HTML")
-    elif response:
-        await message.answer(response)
+        con.execute("UPDATE checkout_sessions SET phone = ?, delivery = ?, address = ?, step = 'confirm' WHERE user_id = ?", (phone[:100], delivery, address, user_id))
+        cart_rows = con.execute("SELECT product_id, quantity FROM cart WHERE user_id = ?", (user_id,)).fetchall()
+    catalog = {str(p["id"]): p for p in all_visible_products()}
+    items, total = [], 0
+    for pid, qty in cart_rows:
+        product = catalog.get(str(pid))
+        if product and product["available"]:
+            subtotal = product["price"] * qty
+            total += subtotal
+            items.append(f"• {escape(product['name'])} × {qty} — {subtotal} ₽")
+    if not items:
+        await message.answer("В корзине нет доступных товаров. Вернитесь в каталог и выберите товары заново.")
+        return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить заказ", callback_data="checkout:confirm")
+    builder.button(text="❌ Отменить", callback_data="checkout:cancel")
+    builder.adjust(1)
+    await message.answer(
+        "<b>Проверьте заказ</b>\n\n" + "\n".join(items) +
+        f"\n\n<b>Итого: {total} ₽</b>\nИмя: {escape(name)}\nТелефон: {escape(phone)}\n" +
+        f"Данные доставки: {escape(address)}\n\nTelegram-профиль будет прикреплён к заказу.",
+        reply_markup=builder.as_markup(), parse_mode="HTML"
+    )
 
 @dp.callback_query(F.data == "checkout:cancel")
 async def checkout_cancel(callback: CallbackQuery):
