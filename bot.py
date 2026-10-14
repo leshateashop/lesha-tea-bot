@@ -381,14 +381,20 @@ async def checkout_confirm(callback: CallbackQuery):
             username = callback.from_user.username
             if username:
                 telegram_link = f"<a href=\"https://t.me/{escape(username)}\">@{escape(username)}</a>"
+                contact_url = f"https://t.me/{username}"
             else:
                 telegram_link = f"<a href=\"tg://user?id={user_id}\">Открыть профиль покупателя</a>"
+                contact_url = f"tg://user?id={user_id}"
+            admin_keyboard = InlineKeyboardBuilder()
+            admin_keyboard.button(text="✉️ Написать покупателю", url=contact_url)
             await callback.bot.send_message(
                 int(ADMIN_CHAT_ID),
-                f"🛎 <b>Новый заказ №{order_id}</b>\n\n{item_lines}\n\n<b>Итого: {total} ₽</b>\n"
-                f"Имя: {escape(name)}\nТелефон: {escape(phone)}\nTelegram: {telegram_link} (ID {user_id})\n"
-                f"Данные доставки: {escape(address)}\nСпособ доставки: {escape(delivery)}",
-                parse_mode="HTML", disable_web_page_preview=True
+                f"🛎 <b>Новый заказ №{order_id}</b>\n\n{item_lines}\n\n<b>Итого: {total} ₽</b>\n\n"
+                f"<b>Покупатель</b>\nИмя: {escape(name)}\nТелефон: {escape(phone)}\n"
+                f"Telegram: {telegram_link}\nID: <code>{user_id}</code>\n\n"
+                f"<b>Доставка</b>\nСпособ: {escape(delivery)}\nАдрес / пункт выдачи: {escape(address)}",
+                parse_mode="HTML", disable_web_page_preview=True,
+                reply_markup=admin_keyboard.as_markup()
             )
         except Exception:
             logging.exception("Не удалось отправить заказ владельцу")
@@ -414,6 +420,12 @@ async def checkout_text_step(message: Message):
     import re
     phone_match = re.search(r"(?:\+?\d[\d()\-\s]{7,}\d)", text)
     phone = phone_match.group(0).strip() if phone_match else "Не указан отдельно"
+    # Убираем телефон из исходного сообщения, чтобы он не дублировался в адресе.
+    details_without_phone = text
+    if phone_match:
+        details_without_phone = text[:phone_match.start()] + " " + text[phone_match.end():]
+    details_without_phone = re.sub(r"[;,|]+", " ", details_without_phone)
+    details_without_phone = " ".join(details_without_phone.split()).strip(" .,-")
     lowered = text.lower()
     if "сдэк" in lowered or "cdek" in lowered:
         delivery = "СДЭК"
@@ -425,7 +437,7 @@ async def checkout_text_step(message: Message):
         delivery = "Самовывоз"
     else:
         delivery = "Уточнить по сообщению"
-    address = text[:1000]
+    address = (details_without_phone or "Адрес уточнить")[:1000]
     with sqlite3.connect(DB_PATH) as con:
         con.execute("UPDATE checkout_sessions SET phone = ?, delivery = ?, address = ?, step = 'confirm' WHERE user_id = ?", (phone[:100], delivery, address, user_id))
         cart_rows = con.execute("SELECT product_id, quantity FROM cart WHERE user_id = ?", (user_id,)).fetchall()
