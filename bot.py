@@ -20,6 +20,15 @@ ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "30838531").strip()
 logging.basicConfig(level=logging.INFO)
 dp = Dispatcher()
 
+# Пороговые уровни можно менять здесь. Персональная скидка заменяет уровень,
+# а бонусные рубли не суммируются со скидкой (списание бонусов пока отключено).
+LOYALTY_LEVELS = [
+    (0, "🌱 Новичок", 0),
+    (5000, "🍃 Знаток", 5),
+    (15000, "🍵 Ценитель", 7),
+    (30000, "🏆 Мастер", 10),
+]
+
 # Кнопки категорий сопоставлены с названиями категорий в общем каталоге.
 CATEGORY_ALIASES = {
     "Шу пуэр": ["шу пуэр", "шу", "pu_er_shu"],
@@ -36,10 +45,10 @@ CATEGORY_ALIASES = {
 
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🍃 Выбрать чай"), KeyboardButton(text="🛒 Корзина")],
-        [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="👤 Профиль")],
-        [KeyboardButton(text="📦 Мои заказы"), KeyboardButton(text="🎁 Бонусы")],
-        [KeyboardButton(text="💬 Поддержка")],
+        [KeyboardButton(text="🍃 Выбрать чай"), KeyboardButton(text="🔎 Поиск чая")],
+        [KeyboardButton(text="🛒 Корзина"), KeyboardButton(text="👤 Профиль")],
+        [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="📦 Мои заказы")],
+        [KeyboardButton(text="🎁 Бонусы"), KeyboardButton(text="💬 Поддержка")],
     ],
     resize_keyboard=True,
 )
@@ -131,7 +140,10 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                first_name TEXT
+                first_name TEXT,
+                total_spent INTEGER NOT NULL DEFAULT 0,
+                personal_discount INTEGER NOT NULL DEFAULT 0,
+                bonus_balance INTEGER NOT NULL DEFAULT 0
             )
         """)
         con.execute("""
@@ -141,13 +153,61 @@ def init_db():
             )
         """)
         con.execute("""
+            CREATE TABLE IF NOT EXISTS search_sessions (
+                user_id INTEGER PRIMARY KEY, query TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        con.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
                 name TEXT, phone TEXT, delivery TEXT, address TEXT, items_json TEXT,
                 total INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'Новый',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                subtotal INTEGER NOT NULL DEFAULT 0,
+                discount_percent INTEGER NOT NULL DEFAULT 0,
+                discount_amount INTEGER NOT NULL DEFAULT 0,
+                loyalty_credited INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # Мягкая миграция: добавляет новые поля в уже существующую базу без потери заказов.
+        for table, column, definition in [
+            ("users", "total_spent", "INTEGER NOT NULL DEFAULT 0"),
+            ("users", "personal_discount", "INTEGER NOT NULL DEFAULT 0"),
+            ("users", "bonus_balance", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "subtotal", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "discount_percent", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "discount_amount", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "loyalty_credited", "INTEGER NOT NULL DEFAULT 0"),
+        ]:
+            existing = {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in existing:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+def loyalty_info(user_id):
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT total_spent, personal_discount, bonus_balance FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        return {"spent": 0, "personal": 0, "bonus": 0, "level": LOYALTY_LEVELS[0][1], "level_discount": 0, "discount": 0, "next_threshold": LOYALTY_LEVELS[1][0]}
+    spent, personal, bonus = row
+    level_name, level_discount, next_threshold = LOYALTY_LEVELS[0][1], LOYALTY_LEVELS[0][2], None
+    for i, (threshold, name, discount) in enumerate(LOYALTY_LEVELS):
+        if spent >= threshold:
+            level_name, level_discount = name, discount
+            next_threshold = LOYALTY_LEVELS[i + 1][0] if i + 1 < len(LOYALTY_LEVELS) else None
+    return {
+        "spent": spent, "personal": personal, "bonus": bonus, "level": level_name,
+        "level_discount": level_discount, "discount": personal if personal > 0 else level_discount,
+        "next_threshold": next_threshold,
+    }
+
+def price_with_discount(user_id, subtotal):
+    info = loyalty_info(user_id)
+    percent = info["discount"]
+    amount = round(subtotal * percent / 100)
+    return subtotal - amount, percent, amount
 
 def products_for_category(category):
     products = load_catalog()
@@ -197,7 +257,8 @@ def find_product(product_id):
 async def start(message: Message):
     with sqlite3.connect(DB_PATH) as con:
         con.execute(
-            "INSERT OR REPLACE INTO users(user_id, username, first_name) VALUES (?, ?, ?)",
+            "INSERT INTO users(user_id, username, first_name) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name",
             (message.from_user.id, message.from_user.username, message.from_user.first_name),
         )
     await message.answer(
@@ -217,6 +278,25 @@ async def back_to_categories(callback: CallbackQuery):
     await callback.message.edit_text("Выбери категорию:", reply_markup=category_keyboard())
     await callback.answer()
 
+def product_list_keyboard(products, page, total_pages, prefix, back_callback):
+    builder = InlineKeyboardBuilder()
+    for product in products:
+        status = "" if product["available"] else " · нет в наличии"
+        builder.button(
+            text=f"{product['name']} · {product['price']} ₽{status}"[:64],
+            callback_data=f"product:{product['id']}",
+        )
+    nav = []
+    if page > 0:
+        nav.append(("◀️", f"{prefix}:{page-1}"))
+    if page + 1 < total_pages:
+        nav.append(("▶️", f"{prefix}:{page+1}"))
+    for label, data in nav:
+        builder.button(text=label, callback_data=data)
+    builder.button(text="⬅️ Назад", callback_data=back_callback)
+    builder.adjust(1)
+    return builder.as_markup()
+
 @dp.callback_query(F.data.startswith("cat:"))
 async def show_category(callback: CallbackQuery):
     category = callback.data.split(":", 1)[1]
@@ -229,21 +309,108 @@ async def show_category(callback: CallbackQuery):
         )
         await callback.answer()
         return
-
-    builder = InlineKeyboardBuilder()
-    for p in products:
-        status = "" if p["available"] else " — нет в наличии"
-        builder.button(
-            text=f"{p['name']} · {p['price']} ₽{status}"[:64],
-            callback_data=f"product:{p['id']}",
-        )
-    builder.button(text="⬅️ К категориям", callback_data="categories")
-    builder.adjust(1)
+    page_size = 8
+    page = 0
+    total_pages = max(1, (len(products) + page_size - 1) // page_size)
+    shown = products[page * page_size:(page + 1) * page_size]
+    markup = product_list_keyboard(shown, page, total_pages, f"catpage:{category}", "categories")
     await callback.message.edit_text(
-        f"<b>{escape(category)}</b>\nВыбери товар:",
-        reply_markup=builder.as_markup(),
+        f"<b>{escape(category)}</b> · {len(products)} товаров\nВыбери товар (страница {page+1}/{total_pages}):",
+        reply_markup=markup,
         parse_mode="HTML",
     )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("catpage:"))
+async def show_category_page(callback: CallbackQuery):
+    try:
+        _, category, page_raw = callback.data.split(":", 2)
+        page = max(0, int(page_raw))
+    except (ValueError, TypeError):
+        await callback.answer("Не удалось открыть страницу", show_alert=True)
+        return
+    products = products_for_category(category)
+    page_size = 8
+    total_pages = max(1, (len(products) + page_size - 1) // page_size)
+    page = min(page, total_pages - 1)
+    shown = products[page * page_size:(page + 1) * page_size]
+    markup = product_list_keyboard(shown, page, total_pages, f"catpage:{category}", "categories")
+    await callback.message.edit_text(
+        f"<b>{escape(category)}</b> · {len(products)} товаров\nВыбери товар (страница {page+1}/{total_pages}):",
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+@dp.message(F.text == "🔎 Поиск чая")
+async def search_start(message: Message):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("INSERT INTO search_sessions(user_id, query) VALUES (?, '') ON CONFLICT(user_id) DO UPDATE SET query=''", (message.from_user.id,))
+    await message.answer("Напиши название чая или часть названия. Например: габа, Ворон, Да Хун Пао.")
+
+@dp.message(lambda message: bool(message.from_user) and search_is_waiting(message.from_user.id))
+async def search_receive(message: Message):
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("Напиши название чая текстом.")
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE search_sessions SET query=? WHERE user_id=?", (query, message.from_user.id))
+    await send_search_results(message, query, 0)
+
+async def send_search_results(message_or_callback, query, page):
+    matches = [p for p in all_visible_products() if norm(query) in norm(p["name"]) or norm(query) in norm(p["category"]) or norm(query) in norm(p["description"])]
+    if not matches:
+        if isinstance(message_or_callback, CallbackQuery):
+            await message_or_callback.message.edit_text("Ничего не найдено. Попробуй другое название.", reply_markup=category_keyboard())
+            await message_or_callback.answer()
+        else:
+            await message_or_callback.answer("Ничего не найдено. Попробуй другое название.")
+        return
+    page_size = 8
+    total_pages = max(1, (len(matches) + page_size - 1) // page_size)
+    page = min(max(0, page), total_pages - 1)
+    shown = matches[page * page_size:(page + 1) * page_size]
+    builder = InlineKeyboardBuilder()
+    for product in shown:
+        status = "" if product["available"] else " · нет в наличии"
+        builder.button(text=f"{product['name']} · {product['price']} ₽{status}"[:64], callback_data=f"product:{product['id']}")
+    if page > 0:
+        builder.button(text="◀️ Назад", callback_data=f"searchpage:{page-1}")
+    if page + 1 < total_pages:
+        builder.button(text="Вперёд ▶️", callback_data=f"searchpage:{page+1}")
+    builder.button(text="🔎 Искать снова", callback_data="search:again")
+    builder.button(text="⬅️ К категориям", callback_data="categories")
+    builder.adjust(1)
+    text = f"🔎 <b>Результаты поиска: {escape(query)}</b>\nНайдено: {len(matches)} · страница {page+1}/{total_pages}"
+    if isinstance(message_or_callback, CallbackQuery):
+        await message_or_callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+        await message_or_callback.answer()
+    else:
+        await message_or_callback.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+
+def search_is_waiting(user_id):
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            row = con.execute("SELECT query FROM search_sessions WHERE user_id=?", (user_id,)).fetchone()
+        return row is not None and row[0] == ""
+    except sqlite3.Error:
+        return False
+
+@dp.callback_query(F.data.startswith("searchpage:"))
+async def search_page(callback: CallbackQuery):
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT query FROM search_sessions WHERE user_id=?", (callback.from_user.id,)).fetchone()
+    if not row or not row[0]:
+        await callback.answer("Начни поиск заново", show_alert=True)
+        return
+    await send_search_results(callback, row[0], int(callback.data.split(":", 1)[1]))
+
+@dp.callback_query(F.data == "search:again")
+async def search_again(callback: CallbackQuery):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE search_sessions SET query='' WHERE user_id=?", (callback.from_user.id,))
+    await callback.message.answer("Напиши название чая или часть названия.")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("product:"))
@@ -297,18 +464,21 @@ async def show_cart(message: Message):
         await message.answer("Корзина пока пуста. Нажми «🍃 Выбрать чай», чтобы добавить товары.")
         return
     catalog = {str(p["id"]): p for p in all_visible_products()}
-    lines, total = [], 0
+    lines, subtotal_total = [], 0
     builder = InlineKeyboardBuilder()
     for product_id, quantity in rows:
         p = catalog.get(str(product_id))
         if not p:
             continue
         subtotal = p["price"] * quantity
-        total += subtotal
+        subtotal_total += subtotal
         lines.append(f"• {escape(p['name'])} × {quantity} — {subtotal} ₽")
         builder.button(text=f"Убрать: {p['name']}"[:64], callback_data=f"remove:{product_id}")
     builder.button(text="✅ Оформить заказ", callback_data="checkout:begin")
     builder.adjust(1)
+    total, discount_percent, discount_amount = price_with_discount(message.from_user.id, subtotal_total)
+    if discount_percent:
+        lines.append(f"\nСкидка клиента ({discount_percent}%): −{discount_amount} ₽")
     lines.append(f"\n<b>Итого: {total} ₽</b>")
     await message.answer("\n".join(lines), reply_markup=builder.as_markup(), parse_mode="HTML")
 
@@ -359,23 +529,29 @@ async def checkout_confirm(callback: CallbackQuery):
         return
     name, phone, delivery, address, _ = session
     catalog = {str(p["id"]): p for p in all_visible_products()}
-    items, total = [], 0
+    items, subtotal_total = [], 0
     for pid, qty in cart_rows:
         product = catalog.get(str(pid))
         if product and product["available"]:
             subtotal = product["price"] * qty
-            total += subtotal
+            subtotal_total += subtotal
             items.append({"id": str(pid), "name": product["name"], "quantity": qty, "price": product["price"], "subtotal": subtotal, "weight": product["weight"]})
+    total, discount_percent, discount_amount = price_with_discount(user_id, subtotal_total)
     if not items:
         await callback.answer("В корзине нет доступных товаров", show_alert=True)
         return
     with sqlite3.connect(DB_PATH) as con:
-        cur = con.execute("INSERT INTO orders(user_id, name, phone, delivery, address, items_json, total) VALUES (?, ?, ?, ?, ?, ?, ?)", (user_id, name, phone, delivery, address, json.dumps(items, ensure_ascii=False), total))
+        cur = con.execute(
+            "INSERT INTO orders(user_id, name, phone, delivery, address, items_json, total, subtotal, discount_percent, discount_amount) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, name, phone, delivery, address, json.dumps(items, ensure_ascii=False), total, subtotal_total, discount_percent, discount_amount),
+        )
         order_id = cur.lastrowid
         con.execute("DELETE FROM cart WHERE user_id = ?", (user_id,))
         con.execute("DELETE FROM checkout_sessions WHERE user_id = ?", (user_id,))
     item_lines = "\n".join(f"• {escape(item['name'])} × {item['quantity']} — {item['subtotal']} ₽" for item in items)
-    await callback.message.answer(f"✅ <b>Заказ №{order_id} принят!</b>\n\n{item_lines}\n\n<b>Итого: {total} ₽</b>\nИмя: {escape(name)}\nТелефон: {escape(phone)}\nДоставка: {escape(delivery)}\nАдрес/пункт выдачи: {escape(address)}\n\nМы свяжемся с вами для подтверждения.", parse_mode="HTML", reply_markup=MAIN_MENU)
+    discount_line = f"\nСкидка клиента ({discount_percent}%): −{discount_amount} ₽" if discount_percent else ""
+    await callback.message.answer(f"✅ <b>Заказ №{order_id} принят!</b>\n\n{item_lines}{discount_line}\n\n<b>Итого: {total} ₽</b>\nИмя: {escape(name)}\nТелефон: {escape(phone)}\nДоставка: {escape(delivery)}\nАдрес/пункт выдачи: {escape(address)}\n\nМы свяжемся с вами для подтверждения.", parse_mode="HTML", reply_markup=MAIN_MENU)
     if ADMIN_CHAT_ID:
         try:
             username = callback.from_user.username
@@ -389,7 +565,7 @@ async def checkout_confirm(callback: CallbackQuery):
             admin_keyboard.button(text="✉️ Написать покупателю", url=contact_url)
             await callback.bot.send_message(
                 int(ADMIN_CHAT_ID),
-                f"🛎 <b>Новый заказ №{order_id}</b>\n\n{item_lines}\n\n<b>Итого: {total} ₽</b>\n\n"
+                f"🛎 <b>Новый заказ №{order_id}</b>\n\n{item_lines}{discount_line}\n\n<b>Итого: {total} ₽</b>\n\n"
                 f"<b>Покупатель</b>\nИмя: {escape(name)}\nТелефон: {escape(phone)}\n"
                 f"Telegram: {telegram_link}\nID: <code>{user_id}</code>\n\n"
                 f"<b>Доставка</b>\nСпособ: {escape(delivery)}\nАдрес / пункт выдачи: {escape(address)}",
@@ -442,13 +618,14 @@ async def checkout_text_step(message: Message):
         con.execute("UPDATE checkout_sessions SET phone = ?, delivery = ?, address = ?, step = 'confirm' WHERE user_id = ?", (phone[:100], delivery, address, user_id))
         cart_rows = con.execute("SELECT product_id, quantity FROM cart WHERE user_id = ?", (user_id,)).fetchall()
     catalog = {str(p["id"]): p for p in all_visible_products()}
-    items, total = [], 0
+    items, subtotal_total = [], 0
     for pid, qty in cart_rows:
         product = catalog.get(str(pid))
         if product and product["available"]:
             subtotal = product["price"] * qty
-            total += subtotal
+            subtotal_total += subtotal
             items.append(f"• {escape(product['name'])} × {qty} — {subtotal} ₽")
+    total, discount_percent, discount_amount = price_with_discount(user_id, subtotal_total)
     if not items:
         await message.answer("В корзине нет доступных товаров. Вернитесь в каталог и выберите товары заново.")
         return
@@ -458,6 +635,7 @@ async def checkout_text_step(message: Message):
     builder.adjust(1)
     await message.answer(
         "<b>Проверьте заказ</b>\n\n" + "\n".join(items) +
+        (f"\n\nСкидка клиента ({discount_percent}%): −{discount_amount} ₽" if discount_percent else "") +
         f"\n\n<b>Итого: {total} ₽</b>\nИмя: {escape(name)}\nТелефон: {escape(phone)}\n" +
         f"Данные доставки: {escape(address)}\n\nTelegram-профиль будет прикреплён к заказу.",
         reply_markup=builder.as_markup(), parse_mode="HTML"
@@ -484,9 +662,18 @@ async def favorites(message: Message):
 
 @dp.message(F.text == "👤 Профиль")
 async def profile(message: Message):
+    info = loyalty_info(message.from_user.id)
+    discount_source = f"Персональная скидка: {info['personal']}%" if info["personal"] else f"Скидка по уровню: {info['level_discount']}%"
+    next_line = f"До следующего уровня: ещё {max(0, info['next_threshold'] - info['spent'])} ₽\n" if info["next_threshold"] is not None else "У вас максимальный уровень!\n"
     await message.answer(
-        f"👤 Ваш профиль\nTelegram ID: {message.from_user.id}\n"
-        "Если нужна помощь с заказом — нажми «💬 Поддержка»."
+        f"👤 <b>Ваш профиль</b>\n\nИмя: {escape(message.from_user.full_name or message.from_user.first_name or 'Покупатель')}\n"
+        f"Telegram: @{escape(message.from_user.username) if message.from_user.username else 'не указан'}\n"
+        f"Telegram ID: <code>{message.from_user.id}</code>\n\n"
+        f"🏷 Уровень: <b>{escape(info['level'])}</b>\n{discount_source}\n"
+        f"Потрачено на выполненные заказы: {info['spent']} ₽\n{next_line}"
+        f"🎁 Бонусный баланс: {info['bonus']} ₽\n\n"
+        "Персональную скидку может назначить владелец магазина. Бонусные рубли пока не списываются вместе со скидкой.",
+        parse_mode="HTML",
     )
 
 @dp.message(F.text == "📦 Мои заказы")
@@ -501,11 +688,94 @@ async def orders(message: Message):
 
 @dp.message(F.text == "🎁 Бонусы")
 async def bonuses(message: Message):
-    await message.answer("Бонусная программа пока не подключена.")
+    info = loyalty_info(message.from_user.id)
+    await message.answer(
+        f"🎁 <b>Ваша программа лояльности</b>\n\nУровень: {escape(info['level'])}\n"
+        f"Скидка сейчас: {info['discount']}%\nНакоплено покупок: {info['spent']} ₽\n"
+        f"Бонусный баланс: {info['bonus']} ₽\n\n"
+        "Скидка и бонусы не суммируются. Списание бонусных рублей подключим отдельно.",
+        parse_mode="HTML",
+    )
 
 @dp.message(F.text == "💬 Поддержка")
 async def support(message: Message):
     await message.answer("Напиши сюда свой вопрос — сообщение увидим в этом чате. Для быстрого заказа можно также написать в Telegram-магазин.")
+
+@dp.message(Command("client"))
+async def admin_client(message: Message):
+    if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /client TELEGRAM_ID")
+        return
+    user_id = int(parts[1])
+    with sqlite3.connect(DB_PATH) as con:
+        user = con.execute("SELECT username, first_name, total_spent, personal_discount, bonus_balance FROM users WHERE user_id=?", (user_id,)).fetchone()
+        orders_count = con.execute("SELECT COUNT(*) FROM orders WHERE user_id=?", (user_id,)).fetchone()[0]
+    if not user:
+        await message.answer("Клиент ещё не запускал бота. Попроси его нажать /start.")
+        return
+    username, first_name, spent, personal, bonus = user
+    info = loyalty_info(user_id)
+    username_text = f"@{escape(username)}" if username else "не указан"
+    await message.answer(
+        f"👤 <b>Клиент</b>\nИмя: {escape(first_name or '—')}\nTelegram: {username_text}\nID: <code>{user_id}</code>\n"
+        f"Заказов: {orders_count}\nВыполненные покупки: {spent} ₽\nУровень: {escape(info['level'])}\n"
+        f"Скидка по уровню: {info['level_discount']}%\nПерсональная скидка: {personal}%\nБонусы: {bonus} ₽\n\n"
+        f"Назначить скидку: <code>/discount {user_id} 15</code>\nСнять персональную скидку: <code>/discount {user_id} 0</code>",
+        parse_mode="HTML",
+    )
+
+@dp.message(Command("discount"))
+async def admin_discount(message: Message):
+    if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        await message.answer("Использование: /discount TELEGRAM_ID ПРОЦЕНТ\nНапример: /discount 123456789 15")
+        return
+    user_id, percent = int(parts[1]), int(parts[2])
+    if percent > 50:
+        await message.answer("Для безопасности скидка не может превышать 50%.")
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("UPDATE users SET personal_discount=? WHERE user_id=?", (percent, user_id))
+        if cur.rowcount == 0:
+            await message.answer("Клиент не найден. Попроси его нажать /start в боте.")
+            return
+    await message.answer(f"✅ Персональная скидка для клиента <code>{user_id}</code> установлена: {percent}%.", parse_mode="HTML")
+    try:
+        await message.bot.send_message(user_id, f"🎁 Для вас установлена персональная скидка {percent}% в «Чайной лавке дяди Лёши».")
+    except Exception:
+        logging.info("Не удалось уведомить клиента %s о скидке", user_id)
+
+@dp.message(Command("order_done"))
+async def admin_order_done(message: Message):
+    if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /order_done НОМЕР_ЗАКАЗА")
+        return
+    order_id = int(parts[1])
+    with sqlite3.connect(DB_PATH) as con:
+        order = con.execute("SELECT user_id, total, status, loyalty_credited FROM orders WHERE id=?", (order_id,)).fetchone()
+        if not order:
+            await message.answer("Заказ не найден.")
+            return
+        user_id, total, status, credited = order
+        if credited:
+            await message.answer("Этот заказ уже учтён в накоплениях — повторного начисления не будет.")
+            return
+        con.execute("UPDATE orders SET status='Выполнен', loyalty_credited=1 WHERE id=?", (order_id,))
+        con.execute("UPDATE users SET total_spent=total_spent+? WHERE user_id=?", (total, user_id))
+    info = loyalty_info(user_id)
+    await message.answer(f"✅ Заказ №{order_id} отмечен выполненным. В накопления клиента добавлено {total} ₽.\nНовый уровень: {info['level']}, скидка по уровню: {info['level_discount']}%.")
+    try:
+        await message.bot.send_message(user_id, f"Спасибо за покупку! Заказ №{order_id} отмечен выполненным и добавлен в вашу программу лояльности. Всего накоплено: {info['spent']} ₽. Уровень: {info['level']}.")
+    except Exception:
+        pass
 
 @dp.message(Command("catalog"))
 async def catalog_count(message: Message):
