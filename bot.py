@@ -9,7 +9,7 @@ from html import escape
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -53,6 +53,11 @@ MAIN_MENU = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+
+def news_draft_waiting(user_id):
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT source_message_id FROM news_drafts WHERE admin_id=?", (user_id,)).fetchone()
+    return bool(row and row[0] == -1)
 
 def norm(value):
     return " ".join(str(value or "").strip().lower().replace("ё", "е").split())
@@ -142,6 +147,21 @@ def init_db():
                 user_id INTEGER PRIMARY KEY,
                 changed_at REAL NOT NULL,
                 reminded INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS news_subscriptions (
+                user_id INTEGER PRIMARY KEY,
+                subscribed INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS news_drafts (
+                admin_id INTEGER PRIMARY KEY,
+                source_chat_id INTEGER NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
         con.execute("""
@@ -318,6 +338,16 @@ def find_product(product_id):
             return p
     return None
 
+def news_subscription_keyboard(user_id):
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT subscribed FROM news_subscriptions WHERE user_id=?", (user_id,)).fetchone()
+    subscribed = bool(row and row[0])
+    button = InlineKeyboardButton(
+        text=("🔕 Отписаться от новостей" if subscribed else "📰 Подписаться на новости"),
+        callback_data=("news:off" if subscribed else "news:on"),
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
+
 @dp.message(CommandStart())
 async def start(message: Message):
     with sqlite3.connect(DB_PATH) as con:
@@ -326,6 +356,8 @@ async def start(message: Message):
             "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name",
             (message.from_user.id, message.from_user.username, message.from_user.first_name),
         )
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("INSERT OR IGNORE INTO news_subscriptions(user_id, subscribed) VALUES (?, 0)", (message.from_user.id,))
     await message.answer(
         "🍵 <b>Чайная лавка дяди Лёши</b>\n"
         "Китайский чай без лишнего пафоса.\n"
@@ -333,6 +365,93 @@ async def start(message: Message):
         reply_markup=MAIN_MENU,
         parse_mode="HTML",
     )
+    await message.answer("📰 Новости и новинки чайной", reply_markup=news_subscription_keyboard(message.from_user.id))
+
+@dp.callback_query(F.data.in_({"news:on", "news:off"}))
+async def news_subscription_toggle(callback: CallbackQuery):
+    subscribed = 1 if callback.data == "news:on" else 0
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO news_subscriptions(user_id, subscribed, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(user_id) DO UPDATE SET subscribed=excluded.subscribed, updated_at=CURRENT_TIMESTAMP",
+            (callback.from_user.id, subscribed),
+        )
+    text = "Вы подписались на новости и новинки. 🍃" if subscribed else "Вы отписались от новостей. Заказы и сообщения по ним это не затрагивает."
+    await callback.message.edit_text(text, reply_markup=news_subscription_keyboard(callback.from_user.id))
+    await callback.answer("Подписка обновлена")
+
+@dp.message(Command("news"))
+async def admin_news_start(message: Message):
+    if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0):
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("DELETE FROM news_drafts WHERE admin_id=?", (message.from_user.id,))
+    await message.answer(
+        "Пришли следующим сообщением текст новости или фото с подписью.\n"
+        "Я покажу предпросмотр и попрошу подтвердить рассылку.\n\n"
+        "Отмена: /news_cancel"
+    )
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("INSERT INTO news_drafts(admin_id, source_chat_id, source_message_id) VALUES (?, ?, ?)",
+                    (message.from_user.id, message.chat.id, -1))
+
+@dp.message(Command("news_cancel"))
+async def admin_news_cancel(message: Message):
+    if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0):
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("DELETE FROM news_drafts WHERE admin_id=?", (message.from_user.id,))
+    await message.answer("Рассылка отменена.")
+
+@dp.message(lambda message: bool(message.from_user) and message.from_user.id == int(ADMIN_CHAT_ID or 0) and news_draft_waiting(message.from_user.id))
+async def admin_news_receive(message: Message):
+    if (message.text or "").startswith("/news"):
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE news_drafts SET source_chat_id=?, source_message_id=? WHERE admin_id=?",
+                    (message.chat.id, message.message_id, message.from_user.id))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Отправить подписчикам", callback_data="news:send")
+    builder.button(text="❌ Отменить", callback_data="news:discard")
+    builder.adjust(1)
+    await message.bot.copy_message(chat_id=message.chat.id, from_chat_id=message.chat.id, message_id=message.message_id)
+    await message.answer("Предпросмотр рассылки. Отправить всем подписчикам?", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data.in_({"news:send", "news:discard"}))
+async def admin_news_action(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != int(ADMIN_CHAT_ID or 0):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        draft = con.execute("SELECT source_chat_id, source_message_id FROM news_drafts WHERE admin_id=?", (callback.from_user.id,)).fetchone()
+    if callback.data == "news:discard":
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute("DELETE FROM news_drafts WHERE admin_id=?", (callback.from_user.id,))
+        await callback.message.edit_text("Рассылка отменена.")
+        await callback.answer()
+        return
+    if not draft or draft[1] < 0:
+        await callback.answer("Сначала подготовь сообщение командой /news", show_alert=True)
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        recipients = [r[0] for r in con.execute("SELECT user_id FROM news_subscriptions WHERE subscribed=1").fetchall()]
+    sent = failed = 0
+    await callback.message.edit_text(f"Рассылка началась. Подписчиков: {len(recipients)}.")
+    for user_id in recipients:
+        try:
+            await callback.bot.copy_message(chat_id=user_id, from_chat_id=draft[0], message_id=draft[1])
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            logging.info("Не удалось отправить новость пользователю %s: %s", user_id, exc)
+            if "blocked" in str(exc).lower() or "chat not found" in str(exc).lower():
+                with sqlite3.connect(DB_PATH) as con:
+                    con.execute("UPDATE news_subscriptions SET subscribed=0 WHERE user_id=?", (user_id,))
+        await asyncio.sleep(0.04)
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("DELETE FROM news_drafts WHERE admin_id=?", (callback.from_user.id,))
+    await callback.message.answer(f"✅ Рассылка завершена. Доставлено: {sent}. Ошибок: {failed}.")
+    await callback.answer("Готово")
 
 @dp.message(F.text == "🍃 Выбрать чай")
 async def choose_tea(message: Message):
