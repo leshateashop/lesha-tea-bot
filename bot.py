@@ -49,6 +49,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text="🛒 Корзина"), KeyboardButton(text="👤 Профиль")],
         [KeyboardButton(text="❤️ Избранное"), KeyboardButton(text="📦 Мои заказы")],
         [KeyboardButton(text="🎁 Бонусы"), KeyboardButton(text="🏷 Промокод")],
+        [KeyboardButton(text="📰 Подписка на новости")],
         [KeyboardButton(text="💬 Поддержка")],
     ],
     resize_keyboard=True,
@@ -366,6 +367,10 @@ async def start(message: Message):
         parse_mode="HTML",
     )
     await message.answer("📰 Новости и новинки чайной", reply_markup=news_subscription_keyboard(message.from_user.id))
+
+@dp.message(F.text == "📰 Подписка на новости")
+async def news_subscription_menu(message: Message):
+    await message.answer("📰 <b>Новости и новинки чайной</b>\nПодписывайтесь, чтобы получать новости о новых чаях, поступлениях и специальных предложениях.", reply_markup=news_subscription_keyboard(message.from_user.id), parse_mode="HTML")
 
 @dp.callback_query(F.data.in_({"news:on", "news:off"}))
 async def news_subscription_toggle(callback: CallbackQuery):
