@@ -162,9 +162,17 @@ def init_db():
                 admin_id INTEGER PRIMARY KEY,
                 source_chat_id INTEGER NOT NULL,
                 source_message_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                mode TEXT NOT NULL DEFAULT 'plain',
+                product_id TEXT NOT NULL DEFAULT ''
             )
         """)
+        # Миграция для уже существующей базы данных.
+        draft_columns = {r[1] for r in con.execute("PRAGMA table_info(news_drafts)").fetchall()}
+        if "mode" not in draft_columns:
+            con.execute("ALTER TABLE news_drafts ADD COLUMN mode TEXT NOT NULL DEFAULT 'plain'")
+        if "product_id" not in draft_columns:
+            con.execute("ALTER TABLE news_drafts ADD COLUMN product_id TEXT NOT NULL DEFAULT ''")
         con.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -391,14 +399,48 @@ async def admin_news_start(message: Message):
         return
     with sqlite3.connect(DB_PATH) as con:
         con.execute("DELETE FROM news_drafts WHERE admin_id=?", (message.from_user.id,))
-    await message.answer(
-        "Пришли следующим сообщением текст новости или фото с подписью.\n"
-        "Я покажу предпросмотр и попрошу подтвердить рассылку.\n\n"
-        "Отмена: /news_cancel"
-    )
+        con.execute("INSERT INTO news_drafts(admin_id, source_chat_id, source_message_id, mode, product_id) VALUES (?, ?, -1, 'plain', '')",
+                    (message.from_user.id, message.chat.id))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📰 Обычная новость", callback_data="news:mode:plain")
+    builder.button(text="🍃 Новость о товаре", callback_data="news:mode:product")
+    builder.adjust(1)
+    await message.answer("Какую рассылку готовим?", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data.in_({"news:mode:plain", "news:mode:product"}))
+async def admin_news_mode(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != int(ADMIN_CHAT_ID or 0):
+        await callback.answer("Нет доступа", show_alert=True); return
+    mode = callback.data.rsplit(":", 1)[1]
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("INSERT INTO news_drafts(admin_id, source_chat_id, source_message_id) VALUES (?, ?, ?)",
-                    (message.from_user.id, message.chat.id, -1))
+        con.execute("UPDATE news_drafts SET mode=?, source_message_id=-1, product_id='' WHERE admin_id=?", (mode, callback.from_user.id))
+    if mode == "plain":
+        await callback.message.edit_text("Пришли текст новости или фото с подписью. Товар и кнопка не добавятся.\nОтмена: /news_cancel")
+    else:
+        products = all_visible_products()
+        if not products:
+            await callback.message.edit_text("Каталог пуст. Проверь файл каталога.")
+            await callback.answer(); return
+        builder = InlineKeyboardBuilder()
+        for product in products[:90]:
+            status = "" if product["available"] else " · нет в наличии"
+            builder.button(text=f"{product['name']} · {product['price']} ₽{status}"[:64], callback_data=f"news:pick:{product['id']}")
+        builder.adjust(1)
+        await callback.message.edit_text("Выбери товар для кнопки перехода к карточке в боте:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("news:pick:"))
+async def admin_news_pick_product(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != int(ADMIN_CHAT_ID or 0):
+        await callback.answer("Нет доступа", show_alert=True); return
+    product_id = callback.data.split(":", 2)[2]
+    product = find_product(product_id)
+    if not product:
+        await callback.answer("Товар не найден в каталоге", show_alert=True); return
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("UPDATE news_drafts SET product_id=?, source_message_id=-1 WHERE admin_id=?", (product_id, callback.from_user.id))
+    await callback.message.edit_text(f"Выбран товар: {product['name']} — {product['price']} ₽.\n\nТеперь пришли текст новости или фото с подписью.\nОтмена: /news_cancel")
+    await callback.answer()
 
 @dp.message(Command("news_cancel"))
 async def admin_news_cancel(message: Message):
@@ -413,9 +455,22 @@ async def admin_news_receive(message: Message):
     if (message.text or "").startswith("/news"):
         return
     with sqlite3.connect(DB_PATH) as con:
+        draft = con.execute("SELECT mode, product_id FROM news_drafts WHERE admin_id=?", (message.from_user.id,)).fetchone()
+        if not draft:
+            return
+        mode, product_id = draft
+        if mode == "product" and not product_id:
+            await message.answer("Сначала выбери товар. Запусти /news заново.")
+            return
         con.execute("UPDATE news_drafts SET source_chat_id=?, source_message_id=? WHERE admin_id=?",
                     (message.chat.id, message.message_id, message.from_user.id))
     builder = InlineKeyboardBuilder()
+    if mode == "product":
+        product = find_product(product_id)
+        if not product:
+            await message.answer("Товар не найден. Запусти /news заново.")
+            return
+        builder.button(text="🍃 Посмотреть чай", callback_data=f"product:{product_id}")
     builder.button(text="✅ Отправить подписчикам", callback_data="news:send")
     builder.button(text="❌ Отменить", callback_data="news:discard")
     builder.adjust(1)
@@ -428,7 +483,7 @@ async def admin_news_action(callback: CallbackQuery):
         await callback.answer("Нет доступа", show_alert=True)
         return
     with sqlite3.connect(DB_PATH) as con:
-        draft = con.execute("SELECT source_chat_id, source_message_id FROM news_drafts WHERE admin_id=?", (callback.from_user.id,)).fetchone()
+        draft = con.execute("SELECT source_chat_id, source_message_id, mode, product_id FROM news_drafts WHERE admin_id=?", (callback.from_user.id,)).fetchone()
     if callback.data == "news:discard":
         with sqlite3.connect(DB_PATH) as con:
             con.execute("DELETE FROM news_drafts WHERE admin_id=?", (callback.from_user.id,))
@@ -438,13 +493,20 @@ async def admin_news_action(callback: CallbackQuery):
     if not draft or draft[1] < 0:
         await callback.answer("Сначала подготовь сообщение командой /news", show_alert=True)
         return
+    source_chat_id, source_message_id, mode, product_id = draft
+    recipients = []
     with sqlite3.connect(DB_PATH) as con:
         recipients = [r[0] for r in con.execute("SELECT user_id FROM news_subscriptions WHERE subscribed=1").fetchall()]
+    reply_markup = None
+    if mode == "product" and product_id:
+        product = find_product(product_id)
+        if product:
+            reply_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🍃 Посмотреть чай", callback_data=f"product:{product_id}")]])
     sent = failed = 0
     await callback.message.edit_text(f"Рассылка началась. Подписчиков: {len(recipients)}.")
     for user_id in recipients:
         try:
-            await callback.bot.copy_message(chat_id=user_id, from_chat_id=draft[0], message_id=draft[1])
+            await callback.bot.copy_message(chat_id=user_id, from_chat_id=source_chat_id, message_id=source_message_id, reply_markup=reply_markup)
             sent += 1
         except Exception as exc:
             failed += 1
