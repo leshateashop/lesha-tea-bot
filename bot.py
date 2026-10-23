@@ -14,7 +14,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "tea_shop.db")
-CATALOG_PATH = os.getenv("CATALOG_PATH", "catalog.csv")
+BASE_DIR = Path(__file__).resolve().parent
+CATALOG_PATH = os.getenv("CATALOG_PATH", str(BASE_DIR / "catalog.csv"))
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "30838531").strip()
 
 logging.basicConfig(level=logging.INFO)
@@ -491,11 +492,25 @@ async def show_product(callback: CallbackQuery):
         try:
             photo_value = product["photo"].strip()
             photo_path = Path(photo_value)
-            if not photo_path.is_absolute() and not photo_path.exists():
-                candidate = Path("photos") / photo_value
-                if candidate.exists():
-                    photo_path = candidate
-            photo_source = FSInputFile(str(photo_path)) if photo_path.is_file() else photo_value
+            candidates = []
+            if photo_path.is_absolute():
+                candidates.append(photo_path)
+            else:
+                # Ищем файл относительно папки bot.py, независимо от рабочей директории Railway.
+                candidates.extend([
+                    BASE_DIR / photo_path,
+                    BASE_DIR / "photos" / photo_path,
+                    Path.cwd() / photo_path,
+                    Path.cwd() / "photos" / photo_path,
+                ])
+            resolved_photo = next((candidate.resolve() for candidate in candidates if candidate.is_file()), None)
+            if resolved_photo:
+                photo_source = FSInputFile(str(resolved_photo))
+            else:
+                # Если в CSV записан Telegram file_id или URL, используем его как есть.
+                photo_source = photo_value
+                logging.warning("Фото не найдено локально: product_id=%s, value=%r, tried=%s",
+                                product["id"], photo_value, [str(p) for p in candidates])
             await callback.message.answer_photo(
                 photo=photo_source,
                 caption=caption,
