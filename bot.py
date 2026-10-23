@@ -449,6 +449,7 @@ async def send_search_results(message_or_callback, query, page):
     builder.button(text="❤️ В избранное", callback_data=f"fav:add:{product['id']}")
     builder.button(text="⬅️ К категориям", callback_data="categories")
     builder.adjust(1)
+    
     text = f"🔎 <b>Результаты поиска: {escape(query)}</b>\nНайдено: {len(matches)} · страница {page+1}/{total_pages}"
     if isinstance(message_or_callback, CallbackQuery):
         await message_or_callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
