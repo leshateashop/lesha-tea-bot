@@ -449,7 +449,6 @@ async def send_search_results(message_or_callback, query, page):
     builder.button(text="❤️ В избранное", callback_data=f"fav:add:{product['id']}")
     builder.button(text="⬅️ К категориям", callback_data="categories")
     builder.adjust(1)
-    
     text = f"🔎 <b>Результаты поиска: {escape(query)}</b>\nНайдено: {len(matches)} · страница {page+1}/{total_pages}"
     if isinstance(message_or_callback, CallbackQuery):
         await message_or_callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
@@ -488,41 +487,63 @@ async def show_product(callback: CallbackQuery):
     if not product:
         await callback.answer("Товар не найден в каталоге. Обнови список.", show_alert=True)
         return
+
     caption = format_product(product)
-    if product["photo"]:
+
+    # Если фото нет — превращаем сообщение со списком в полную карточку,
+    # вместо отправки второго сообщения.
+    if not product["photo"]:
         try:
-            photo_value = product["photo"].strip()
-            photo_path = Path(photo_value)
-            candidates = []
-            if photo_path.is_absolute():
-                candidates.append(photo_path)
-            else:
-                # Ищем файл относительно папки bot.py, независимо от рабочей директории Railway.
-                candidates.extend([
-                    BASE_DIR / photo_path,
-                    BASE_DIR / "photos" / photo_path,
-                    Path.cwd() / photo_path,
-                    Path.cwd() / "photos" / photo_path,
-                ])
-            resolved_photo = next((candidate.resolve() for candidate in candidates if candidate.is_file()), None)
-            if resolved_photo:
-                photo_source = FSInputFile(str(resolved_photo))
-            else:
-                # Если в CSV записан Telegram file_id или URL, используем его как есть.
-                photo_source = photo_value
-                logging.warning("Фото не найдено локально: product_id=%s, value=%r, tried=%s",
-                                product["id"], photo_value, [str(p) for p in candidates])
-            await callback.message.answer_photo(
-                photo=photo_source,
-                caption=caption,
+            await callback.message.edit_text(
+                caption,
                 reply_markup=product_keyboard(product),
                 parse_mode="HTML",
             )
         except Exception:
-            logging.exception("Не удалось отправить фото товара %s (photo=%r)", product["id"], product["photo"])
-            await callback.message.answer(caption, reply_markup=product_keyboard(product), parse_mode="HTML")
-    else:
-        await callback.message.answer(caption, reply_markup=product_keyboard(product), parse_mode="HTML")
+            logging.exception("Не удалось заменить список карточкой товара %s", product["id"])
+            await callback.message.answer(
+                caption,
+                reply_markup=product_keyboard(product),
+                parse_mode="HTML",
+            )
+        await callback.answer()
+        return
+
+    # Telegram не позволяет превратить обычное текстовое сообщение со списком
+    # в фото-сообщение, поэтому фото-карточка отправляется один раз.
+    try:
+        photo_value = product["photo"].strip()
+        photo_path = Path(photo_value)
+        candidates = []
+        if photo_path.is_absolute():
+            candidates.append(photo_path)
+        else:
+            candidates.extend([
+                BASE_DIR / photo_path,
+                BASE_DIR / "photos" / photo_path,
+                Path.cwd() / photo_path,
+                Path.cwd() / "photos" / photo_path,
+            ])
+        resolved_photo = next((candidate.resolve() for candidate in candidates if candidate.is_file()), None)
+        photo_source = FSInputFile(str(resolved_photo)) if resolved_photo else photo_value
+        if not resolved_photo:
+            logging.warning(
+                "Фото не найдено локально: product_id=%s, value=%r, tried=%s",
+                product["id"], photo_value, [str(p) for p in candidates]
+            )
+        await callback.message.answer_photo(
+            photo=photo_source,
+            caption=caption,
+            reply_markup=product_keyboard(product),
+            parse_mode="HTML",
+        )
+    except Exception:
+        logging.exception("Не удалось отправить фото товара %s (photo=%r)", product["id"], product["photo"])
+        await callback.message.answer(
+            caption,
+            reply_markup=product_keyboard(product),
+            parse_mode="HTML",
+        )
     await callback.answer()
 
 @dp.callback_query(F.data == "unavailable")
