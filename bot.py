@@ -131,6 +131,11 @@ def load_catalog():
 def init_db():
     with sqlite3.connect(DB_PATH) as con:
         con.execute("""
+            CREATE TABLE IF NOT EXISTS product_overrides (
+                product_id TEXT PRIMARY KEY, available INTEGER, show_product INTEGER
+            )
+        """)
+        con.execute("""
             CREATE TABLE IF NOT EXISTS cart (
                 user_id INTEGER NOT NULL,
                 product_id TEXT NOT NULL,
@@ -275,7 +280,7 @@ def price_with_discount(user_id, subtotal):
     return subtotal - amount, percent, amount
 
 def products_for_category(category):
-    products = load_catalog()
+    products = all_visible_products()
     aliases = CATEGORY_ALIASES.get(category, [norm(category)])
     return [
         p for p in products
@@ -311,7 +316,26 @@ def format_product(product):
     return text
 
 def all_visible_products():
-    return load_catalog()
+    products = load_catalog()
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            overrides = {row[0]: row[1:] for row in con.execute(
+                "SELECT product_id, available, show_product FROM product_overrides"
+            )}
+        result = []
+        for product in products:
+            override = overrides.get(str(product["id"]))
+            if override:
+                available, show_product = override
+                if available is not None:
+                    product["available"] = bool(available)
+                if show_product == 0:
+                    continue
+            result.append(product)
+        return result
+    except sqlite3.Error:
+        logging.exception("Не удалось применить настройки наличия товаров")
+        return products
 
 def find_product(product_id):
     for p in all_visible_products():
@@ -964,6 +988,53 @@ async def bonuses(message: Message):
 @dp.message(F.text == "💬 Поддержка")
 async def support(message: Message):
     await message.answer("Напиши сюда свой вопрос — сообщение увидим в этом чате. Для быстрого заказа можно также написать в Telegram-магазин.")
+
+@dp.message(Command("stock"))
+async def admin_stock(message: Message):
+    if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0):
+        return
+    products = all_visible_products()
+    if not products:
+        await message.answer("Каталог пуст.")
+        return
+    await message.answer("📦 <b>Управление наличием</b>\nНажми на товар, чтобы изменить статус:", parse_mode="HTML")
+    for product in products:
+        status = "✅ В наличии" if product["available"] else "❌ Нет в наличии"
+        builder = InlineKeyboardBuilder()
+        builder.button(
+            text=f"{status} · {product['name']}"[:64],
+            callback_data=f"stock:toggle:{product['id']}",
+        )
+        await message.answer(
+            f"<b>{escape(product['name'])}</b> · {product['price']} ₽",
+            parse_mode="HTML", reply_markup=builder.as_markup()
+        )
+
+@dp.callback_query(F.data.startswith("stock:toggle:"))
+async def admin_stock_toggle(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != int(ADMIN_CHAT_ID or 0):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    product_id = callback.data.split(":", 2)[2]
+    product = next((p for p in all_visible_products() if str(p["id"]) == product_id), None)
+    if not product:
+        await callback.answer("Товар не найден", show_alert=True)
+        return
+    new_status = not product["available"]
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute(
+            "INSERT INTO product_overrides(product_id, available, show_product) VALUES (?, ?, NULL) "
+            "ON CONFLICT(product_id) DO UPDATE SET available=excluded.available",
+            (product_id, int(new_status)),
+        )
+    status = "✅ В наличии" if new_status else "❌ Нет в наличии"
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"{status} · {product['name']}"[:64], callback_data=f"stock:toggle:{product_id}")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
+    except Exception:
+        pass
+    await callback.answer(f"Статус изменён: {status}")
 
 @dp.message(Command("client"))
 async def admin_client(message: Message):
