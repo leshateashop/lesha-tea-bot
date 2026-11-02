@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+import fcntl
 from html import escape
 
 from aiogram import Bot, Dispatcher, F
@@ -13,10 +14,21 @@ from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardB
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = os.getenv("DB_PATH", "tea_shop.db")
 BASE_DIR = Path(__file__).resolve().parent
+# На Railway база должна лежать на подключённом Volume, смонтированном в /data.
+# Переменная DB_PATH может переопределить путь; локальный fallback оставлен для разработки.
+DB_PATH = os.getenv("DB_PATH", "/data/tea_shop.db")
 CATALOG_PATH = os.getenv("CATALOG_PATH", str(BASE_DIR / "catalog.csv"))
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "30838531").strip()
+
+# Единые параметры SQLite для всех операций: таймаут снижает риск ошибок
+# при одновременном чтении корзины и записи заказа.
+def db_connect():
+    db_file = Path(DB_PATH)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db_file), timeout=30)
+    con.execute("PRAGMA busy_timeout=30000")
+    return con
 
 logging.basicConfig(level=logging.INFO)
 dp = Dispatcher()
@@ -133,7 +145,7 @@ def load_catalog():
     return []
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("""
             CREATE TABLE IF NOT EXISTS product_overrides (
                 product_id TEXT PRIMARY KEY, available INTEGER, show_product INTEGER
@@ -244,7 +256,7 @@ def init_db():
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 def loyalty_info(user_id):
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         row = con.execute(
             "SELECT total_spent, personal_discount, bonus_balance FROM users WHERE user_id = ?",
             (user_id,),
@@ -266,7 +278,7 @@ def loyalty_info(user_id):
 def price_with_discount(user_id, subtotal):
     info = loyalty_info(user_id)
     percent = info["discount"]
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         row = con.execute("SELECT active_promo FROM users WHERE user_id=?", (user_id,)).fetchone()
         code = row[0] if row else ""
         promo = con.execute("SELECT percent, max_uses, uses, active, expires_at FROM promo_codes WHERE code=?", (code,)).fetchone() if code else None
@@ -322,7 +334,7 @@ def format_product(product):
 def all_visible_products():
     products = load_catalog()
     try:
-        with sqlite3.connect(DB_PATH) as con:
+        with db_connect() as con:
             overrides = {row[0]: row[1:] for row in con.execute(
                 "SELECT product_id, available, show_product FROM product_overrides"
             )}
@@ -349,7 +361,7 @@ def find_product(product_id):
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute(
             "INSERT INTO users(user_id, username, first_name) VALUES (?, ?, ?) "
             "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name",
@@ -438,7 +450,7 @@ async def show_category_page(callback: CallbackQuery):
 
 @dp.message(F.text == "🔎 Поиск чая")
 async def search_start(message: Message):
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("INSERT INTO search_sessions(user_id, query) VALUES (?, '') ON CONFLICT(user_id) DO UPDATE SET query=''", (message.from_user.id,))
     await message.answer("Напиши название чая или часть названия. Например: габа, Ворон, Да Хун Пао.")
 
@@ -448,7 +460,7 @@ async def search_receive(message: Message):
     if not query:
         await message.answer("Напиши название чая текстом.")
         return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("UPDATE search_sessions SET query=? WHERE user_id=?", (query, message.from_user.id))
     await send_search_results(message, query, 0)
 
@@ -486,7 +498,7 @@ async def send_search_results(message_or_callback, query, page):
 
 def search_is_waiting(user_id):
     try:
-        with sqlite3.connect(DB_PATH) as con:
+        with db_connect() as con:
             row = con.execute("SELECT query FROM search_sessions WHERE user_id=?", (user_id,)).fetchone()
         return row is not None and row[0] == ""
     except sqlite3.Error:
@@ -494,7 +506,7 @@ def search_is_waiting(user_id):
 
 @dp.callback_query(F.data.startswith("searchpage:"))
 async def search_page(callback: CallbackQuery):
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         row = con.execute("SELECT query FROM search_sessions WHERE user_id=?", (callback.from_user.id,)).fetchone()
     if not row or not row[0]:
         await callback.answer("Начни поиск заново", show_alert=True)
@@ -503,7 +515,7 @@ async def search_page(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "search:again")
 async def search_again(callback: CallbackQuery):
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("UPDATE search_sessions SET query='' WHERE user_id=?", (callback.from_user.id,))
     await callback.message.answer("Напиши название чая или часть названия.")
     await callback.answer()
@@ -585,7 +597,7 @@ async def add_to_cart(callback: CallbackQuery):
     if not product or not product["available"]:
         await callback.answer("Товара сейчас нет в наличии.", show_alert=True)
         return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("""
             INSERT INTO cart(user_id, product_id, quantity) VALUES (?, ?, 1)
             ON CONFLICT(user_id, product_id) DO UPDATE SET quantity = quantity + 1
@@ -593,15 +605,19 @@ async def add_to_cart(callback: CallbackQuery):
         con.execute("""INSERT INTO cart_reminders(user_id, changed_at, reminded) VALUES (?, ?, 0)
             ON CONFLICT(user_id) DO UPDATE SET changed_at=excluded.changed_at, reminded=0""",
             (callback.from_user.id, __import__('time').time()))
+    with db_connect() as con:
+        cart_count = con.execute("SELECT COALESCE(SUM(quantity), 0) FROM cart WHERE user_id=?", (callback.from_user.id,)).fetchone()[0]
+    logging.info("CART_ADD user_id=%s product_id=%s total_quantity=%s db=%s", callback.from_user.id, product_id, cart_count, DB_PATH)
     open_cart = InlineKeyboardBuilder()
     open_cart.button(text="🛒 Открыть корзину", callback_data="cart:open")
     await callback.message.answer("Добавлено в корзину 🛒", reply_markup=open_cart.as_markup())
     await callback.answer("Добавлено")
 
 async def send_cart_view(target, user_id):
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         rows = con.execute("SELECT product_id, quantity FROM cart WHERE user_id = ?", (user_id,)).fetchall()
     if not rows:
+        logging.warning("CART_EMPTY user_id=%s db=%s", user_id, DB_PATH)
         await target.answer("Корзина пока пуста. Нажми «🍃 Выбрать чай», чтобы добавить товары.")
         return
     catalog = {str(p["id"]): p for p in all_visible_products()}
@@ -638,7 +654,7 @@ async def open_cart_callback(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("remove:"))
 async def remove_from_cart(callback: CallbackQuery):
     product_id = callback.data.split(":", 1)[1]
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute(
             "DELETE FROM cart WHERE user_id = ? AND product_id = ?",
             (callback.from_user.id, product_id),
@@ -653,13 +669,13 @@ async def remove_from_cart(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "checkout:begin")
 async def checkout_begin(callback: CallbackQuery):
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         rows = con.execute("SELECT product_id, quantity FROM cart WHERE user_id = ?", (callback.from_user.id,)).fetchall()
     catalog = {str(p["id"]): p for p in all_visible_products()}
     if not rows or not any(str(pid) in catalog for pid, _ in rows):
         await callback.answer("Корзина пуста", show_alert=True)
         return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("INSERT OR REPLACE INTO checkout_sessions(user_id, step, name, phone, delivery, address) VALUES (?, 'details', ?, '', 'Уточнить по сообщению', '')", (callback.from_user.id, callback.from_user.full_name or callback.from_user.first_name or 'Покупатель'))
     await callback.message.answer("🧾 <b>Оформление заказа</b>\n\nНапишите <b>одним сообщением</b> ваш телефон и данные доставки: город, адрес или пункт выдачи. Способ доставки тоже укажите, если уже знаете.\n\nИмя и Telegram мы добавим автоматически. Пример: +7 900 123-45-67, СДЭК, пункт выдачи в Москве — адрес уточню.", parse_mode="HTML")
     await callback.answer()
@@ -667,7 +683,7 @@ async def checkout_begin(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("delivery:"))
 async def checkout_delivery(callback: CallbackQuery):
     delivery = callback.data.split(":", 1)[1]
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         row = con.execute("SELECT step FROM checkout_sessions WHERE user_id = ?", (callback.from_user.id,)).fetchone()
         if not row or row[0] != "delivery":
             await callback.answer("Начните оформление из корзины", show_alert=True)
@@ -679,7 +695,7 @@ async def checkout_delivery(callback: CallbackQuery):
 @dp.callback_query(F.data == "checkout:confirm")
 async def checkout_confirm(callback: CallbackQuery):
     user_id = callback.from_user.id
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         session = con.execute("SELECT name, phone, delivery, address, step FROM checkout_sessions WHERE user_id = ?", (user_id,)).fetchone()
         cart_rows = con.execute("SELECT product_id, quantity FROM cart WHERE user_id = ?", (user_id,)).fetchall()
     if not session or session[4] != "confirm":
@@ -695,13 +711,13 @@ async def checkout_confirm(callback: CallbackQuery):
             subtotal_total += subtotal
             items.append({"id": str(pid), "name": product["name"], "quantity": qty, "price": product["price"], "subtotal": subtotal, "weight": product["weight"]})
     total, discount_percent, discount_amount = price_with_discount(user_id, subtotal_total)
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         promo_row = con.execute("SELECT active_promo FROM users WHERE user_id=?", (user_id,)).fetchone()
         promo_code = promo_row[0] if promo_row else ""
     if not items:
         await callback.answer("В корзине нет доступных товаров", show_alert=True)
         return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         cur = con.execute(
             "INSERT INTO orders(user_id, name, phone, delivery, address, items_json, total, subtotal, discount_percent, discount_amount, promo_code) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -731,6 +747,7 @@ async def checkout_confirm(callback: CallbackQuery):
             admin_keyboard.button(text="✅ Подтвердить заказ", callback_data=f"admin_order:confirm:{order_id}")
             admin_keyboard.button(text="✉️ Написать покупателю", url=contact_url)
             admin_keyboard.adjust(1)
+            logging.info("ORDER_NOTIFY_ATTEMPT order_id=%s admin_chat_id=%s", order_id, ADMIN_CHAT_ID)
             await callback.bot.send_message(
                 int(ADMIN_CHAT_ID),
                 f"🛎 <b>Новый заказ №{order_id}</b>\n\n{item_lines}{discount_line}\n\n<b>Итого: {total} ₽</b>\n\n"
@@ -741,7 +758,7 @@ async def checkout_confirm(callback: CallbackQuery):
                 reply_markup=admin_keyboard.as_markup()
             )
         except Exception:
-            logging.exception("Не удалось отправить заказ владельцу")
+            logging.exception("Не удалось отправить заказ владельцу: order_id=%s admin_chat_id=%s", order_id, ADMIN_CHAT_ID)
     await callback.answer("Заказ оформлен")
 
 @dp.callback_query(F.data.startswith("admin_order:confirm:"))
@@ -754,7 +771,7 @@ async def admin_confirm_order(callback: CallbackQuery):
     except (ValueError, IndexError):
         await callback.answer("Некорректный номер заказа", show_alert=True)
         return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         row = con.execute("SELECT user_id, status FROM orders WHERE id=?", (order_id,)).fetchone()
         if not row:
             await callback.answer("Заказ не найден", show_alert=True)
@@ -779,9 +796,11 @@ async def checkout_text_step(message: Message):
     if not text:
         await message.answer("Пожалуйста, отправьте данные текстом одним сообщением.")
         return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         row = con.execute("SELECT step, name, phone, delivery, address FROM checkout_sessions WHERE user_id = ?", (user_id,)).fetchone()
     if not row:
+        logging.error("CHECKOUT_SESSION_MISSING user_id=%s db=%s", user_id, DB_PATH)
+        await message.answer("Не удалось продолжить оформление: сессия заказа не найдена. Откройте корзину и нажмите «Оформить заказ» ещё раз.", reply_markup=MAIN_MENU)
         return
     step, name, phone, delivery, address = row
     if step != "details":
@@ -810,7 +829,7 @@ async def checkout_text_step(message: Message):
     else:
         delivery = "Уточнить по сообщению"
     address = (details_without_phone or "Адрес уточнить")[:1000]
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("UPDATE checkout_sessions SET phone = ?, delivery = ?, address = ?, step = 'confirm' WHERE user_id = ?", (phone[:100], delivery, address, user_id))
         cart_rows = con.execute("SELECT product_id, quantity FROM cart WHERE user_id = ?", (user_id,)).fetchall()
     catalog = {str(p["id"]): p for p in all_visible_products()}
@@ -822,7 +841,7 @@ async def checkout_text_step(message: Message):
             subtotal_total += subtotal
             items.append(f"• {escape(product['name'])} × {qty} — {subtotal} ₽")
     total, discount_percent, discount_amount = price_with_discount(user_id, subtotal_total)
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         promo_row = con.execute("SELECT active_promo FROM users WHERE user_id=?", (user_id,)).fetchone()
         promo_code = promo_row[0] if promo_row else ""
     if not items:
@@ -842,14 +861,14 @@ async def checkout_text_step(message: Message):
 
 @dp.callback_query(F.data == "checkout:cancel")
 async def checkout_cancel(callback: CallbackQuery):
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("DELETE FROM checkout_sessions WHERE user_id = ?", (callback.from_user.id,))
     await callback.message.answer("Оформление отменено. Товары остались в корзине.", reply_markup=MAIN_MENU)
     await callback.answer()
 
 def checkout_step(user_id):
     try:
-        with sqlite3.connect(DB_PATH) as con:
+        with db_connect() as con:
             row = con.execute("SELECT step FROM checkout_sessions WHERE user_id = ?", (user_id,)).fetchone()
         return row[0] if row else None
     except sqlite3.Error:
@@ -857,7 +876,7 @@ def checkout_step(user_id):
 
 @dp.message(F.text == "🏷 Промокод")
 async def promo_prompt(message: Message):
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("UPDATE users SET promo_waiting=1 WHERE user_id=?", (message.from_user.id,))
     await message.answer("Отправь промокод одним сообщением. Чтобы убрать действующий промокод, напиши СБРОС.")
 
@@ -865,7 +884,7 @@ async def promo_prompt(message: Message):
 async def promo_apply(message: Message):
     user_id = message.from_user.id
     code = (message.text or "").strip().upper()
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("UPDATE users SET promo_waiting=0 WHERE user_id=?", (user_id,))
         if code in {"СБРОС", "СБРОСИТЬ", "ОТМЕНА"}:
             con.execute("UPDATE users SET active_promo='' WHERE user_id=?", (user_id,))
@@ -883,19 +902,19 @@ async def promo_apply(message: Message):
         await message.answer("Срок действия промокода закончился.", reply_markup=MAIN_MENU); return
     if already:
         await message.answer("Ты уже использовал этот промокод.", reply_markup=MAIN_MENU); return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("UPDATE users SET active_promo=? WHERE user_id=?", (code,user_id))
     await message.answer(f"✅ Промокод {escape(code)} применён: скидка {promo[0]}%. Она не суммируется с персональной скидкой и уровнем лояльности — применяется большая.", reply_markup=MAIN_MENU, parse_mode="HTML")
 
 def promo_is_waiting(user_id):
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         row = con.execute("SELECT promo_waiting FROM users WHERE user_id=?", (user_id,)).fetchone()
     return bool(row and row[0])
 
 @dp.message(F.text == "❤️ Избранное")
 async def favorites(message: Message):
     user_id = message.from_user.id
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         rows = con.execute("SELECT product_id FROM favorites WHERE user_id=? ORDER BY created_at DESC", (user_id,)).fetchall()
     products = [find_product(row[0]) for row in rows]
     products = [p for p in products if p]
@@ -916,18 +935,18 @@ async def favorite_add(callback: CallbackQuery):
     if not find_product(product_id):
         await callback.answer("Товар не найден в каталоге.", show_alert=True)
         return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("INSERT OR IGNORE INTO favorites(user_id, product_id) VALUES (?,?)", (callback.from_user.id, product_id))
     await callback.answer("Добавлено в избранное ❤️")
 
 @dp.callback_query(F.data.startswith("fav:remove:"))
 async def favorite_remove(callback: CallbackQuery):
     product_id = callback.data.split(":", 2)[2]
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("DELETE FROM favorites WHERE user_id=? AND product_id=?", (callback.from_user.id, product_id))
     await callback.answer("Убрано из избранного")
     # Обновляем список избранного в том же сообщении.
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         rows = con.execute("SELECT product_id FROM favorites WHERE user_id=? ORDER BY created_at DESC", (callback.from_user.id,)).fetchall()
     products = [find_product(row[0]) for row in rows]
     products = [p for p in products if p]
@@ -960,7 +979,7 @@ async def profile(message: Message):
 
 @dp.message(F.text == "📦 Мои заказы")
 async def orders(message: Message):
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         rows = con.execute("SELECT id, total, status, created_at FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 10", (message.from_user.id,)).fetchall()
     if not rows:
         await message.answer("Пока у вас нет оформленных заказов.")
@@ -980,7 +999,7 @@ async def repeat_order(callback: CallbackQuery):
     except (ValueError, AttributeError):
         await callback.answer("Не удалось определить заказ", show_alert=True)
         return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         row = con.execute("SELECT items_json FROM orders WHERE id=? AND user_id=?", (order_id, callback.from_user.id)).fetchone()
     if not row:
         await callback.answer("Заказ не найден", show_alert=True)
@@ -991,7 +1010,7 @@ async def repeat_order(callback: CallbackQuery):
         old_items = []
     catalog = {str(p["id"]): p for p in all_visible_products()}
     added, unavailable = [], []
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         for item in old_items:
             pid = str(item.get("id", ""))
             product = catalog.get(pid)
@@ -1113,7 +1132,7 @@ async def admin_stock_toggle(callback: CallbackQuery):
         await callback.answer("Товар не найден", show_alert=True)
         return
     new_status = not product["available"]
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute(
             "INSERT INTO product_overrides(product_id, available, show_product) VALUES (?, ?, NULL) "
             "ON CONFLICT(product_id) DO UPDATE SET available=excluded.available",
@@ -1137,7 +1156,7 @@ async def admin_client(message: Message):
         await message.answer("Использование: /client TELEGRAM_ID")
         return
     user_id = int(parts[1])
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         user = con.execute("SELECT username, first_name, total_spent, personal_discount, bonus_balance FROM users WHERE user_id=?", (user_id,)).fetchone()
         orders_count = con.execute("SELECT COUNT(*) FROM orders WHERE user_id=?", (user_id,)).fetchone()[0]
     if not user:
@@ -1166,7 +1185,7 @@ async def admin_discount(message: Message):
     if percent > 50:
         await message.answer("Для безопасности скидка не может превышать 50%.")
         return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         cur = con.execute("UPDATE users SET personal_discount=? WHERE user_id=?", (percent, user_id))
         if cur.rowcount == 0:
             await message.answer("Клиент не найден. Попроси его нажать /start в боте.")
@@ -1189,7 +1208,7 @@ async def admin_promo_create(message: Message):
     limit = int(parts[3]) if len(parts)==4 else 0
     if not code.isalnum() or not 1 <= percent <= 50 or limit < 0:
         await message.answer("Код — латинские буквы/цифры без пробелов, скидка от 1 до 50%, лимит неотрицательный."); return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         con.execute("INSERT INTO promo_codes(code,percent,max_uses,uses,active) VALUES (?,?,?,0,1) ON CONFLICT(code) DO UPDATE SET percent=excluded.percent,max_uses=excluded.max_uses,uses=0,active=1,expires_at=NULL", (code,percent,limit))
         con.execute("DELETE FROM promo_redemptions WHERE code=?", (code,))
     await message.answer(f"✅ Промокод {escape(code)} создан: скидка {percent}%, лимит: {limit if limit else 'без ограничений'}.", parse_mode="HTML")
@@ -1197,7 +1216,7 @@ async def admin_promo_create(message: Message):
 @dp.message(Command("promo_list"))
 async def admin_promo_list(message: Message):
     if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0): return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         rows = con.execute("SELECT code,percent,max_uses,uses,active FROM promo_codes ORDER BY code").fetchall()
     if not rows:
         await message.answer("Промокодов пока нет."); return
@@ -1210,7 +1229,7 @@ async def admin_promo_off(message: Message):
     if len(parts)!=2:
         await message.answer("Использование: /promo_off КОД"); return
     code=parts[1].upper()
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         cur=con.execute("UPDATE promo_codes SET active=0 WHERE code=?", (code,))
     await message.answer("Промокод выключен." if cur.rowcount else "Промокод не найден.")
 
@@ -1223,7 +1242,7 @@ async def admin_order_done(message: Message):
         await message.answer("Использование: /order_done НОМЕР_ЗАКАЗА")
         return
     order_id = int(parts[1])
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         order = con.execute("SELECT user_id, total, status, loyalty_credited FROM orders WHERE id=?", (order_id,)).fetchone()
         if not order:
             await message.answer("Заказ не найден.")
@@ -1252,7 +1271,7 @@ async def review_start(callback: CallbackQuery):
     except (ValueError, AttributeError):
         await callback.answer("Некорректный номер заказа", show_alert=True)
         return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         order = con.execute("SELECT status FROM orders WHERE id=? AND user_id=?", (order_id, callback.from_user.id)).fetchone()
         existing = con.execute("SELECT 1 FROM reviews WHERE user_id=? AND order_id=?", (callback.from_user.id, order_id)).fetchone()
         if order and order[0] == "Выполнен" and not existing:
@@ -1275,7 +1294,7 @@ async def review_receive(message: Message):
     if len(review_text) > 1500:
         await message.answer("Отзыв слишком длинный. Максимум 1500 символов.")
         return
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         row = con.execute("SELECT order_id FROM review_sessions WHERE user_id=?", (user_id,)).fetchone()
         if not row:
             return
@@ -1293,7 +1312,7 @@ async def review_receive(message: Message):
     await message.answer("Спасибо! Отзыв отправлен на проверку.", reply_markup=MAIN_MENU)
 
 def review_waiting(user_id):
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         return con.execute("SELECT 1 FROM review_sessions WHERE user_id=?", (user_id,)).fetchone() is not None
 
 @dp.callback_query(F.data.startswith("review:approve:"))
@@ -1303,7 +1322,7 @@ async def review_approve(callback: CallbackQuery):
         return
     parts = callback.data.split(":")
     user_id, order_id = int(parts[2]), int(parts[3])
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         cur = con.execute("UPDATE reviews SET status='approved' WHERE user_id=? AND order_id=? AND status='pending'", (user_id, order_id))
     if cur.rowcount:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -1321,7 +1340,7 @@ async def review_reject(callback: CallbackQuery):
         return
     parts = callback.data.split(":")
     user_id, order_id = int(parts[2]), int(parts[3])
-    with sqlite3.connect(DB_PATH) as con:
+    with db_connect() as con:
         cur = con.execute("UPDATE reviews SET status='rejected' WHERE user_id=? AND order_id=? AND status='pending'", (user_id, order_id))
     if cur.rowcount:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -1339,6 +1358,12 @@ async def catalog_count(message: Message):
 
 @dp.message()
 async def fallback(message: Message):
+    # Резервная маршрутизация: если фильтр оформления не сработал,
+    # не теряем телефон/адрес покупателя в общем меню.
+    if message.from_user and message.text and checkout_step(message.from_user.id) is not None and not is_menu_text(message):
+        logging.warning("CHECKOUT_FALLBACK_ROUTE user_id=%s db=%s", message.from_user.id, DB_PATH)
+        await checkout_text_step(message)
+        return
     await message.answer("Выбери действие в меню ниже.", reply_markup=MAIN_MENU)
 
 async def abandoned_cart_reminder_loop(bot: Bot):
@@ -1347,7 +1372,7 @@ async def abandoned_cart_reminder_loop(bot: Bot):
     while True:
         await asyncio.sleep(900)
         cutoff = time.time() - 3 * 60 * 60
-        with sqlite3.connect(DB_PATH) as con:
+        with db_connect() as con:
             rows = con.execute("""SELECT r.user_id FROM cart_reminders r
                 WHERE r.reminded=0 AND r.changed_at<=?
                 AND EXISTS (SELECT 1 FROM cart c WHERE c.user_id=r.user_id)""", (cutoff,)).fetchall()
@@ -1358,7 +1383,7 @@ async def abandoned_cart_reminder_loop(bot: Bot):
                     "🍃 В вашей корзине остался чай. Если захотите продолжить, откройте «🛒 Корзина». Цены и наличие проверим при оформлении.",
                     reply_markup=MAIN_MENU,
                 )
-                with sqlite3.connect(DB_PATH) as con:
+                with db_connect() as con:
                     con.execute("UPDATE cart_reminders SET reminded=1 WHERE user_id=?", (user_id,))
             except Exception:
                 logging.info("Не удалось отправить напоминание о корзине пользователю %s", user_id)
@@ -1366,10 +1391,29 @@ async def abandoned_cart_reminder_loop(bot: Bot):
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
+
+    # Защита от случайного второго процесса внутри одного контейнера.
+    # Для разных контейнеров/деплоев дополнительно нужна одна активная реплика.
+    lock_path = "/tmp/lesha_tea_bot_polling.lock"
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logging.critical("POLLING_LOCKED: другой процесс бота уже работает в этом контейнере")
+        raise SystemExit("Другой экземпляр бота уже запущен в этом контейнере")
+
+    db_file = Path(DB_PATH)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
     init_db()
+    logging.info("DATABASE_READY path=%s exists=%s", db_file.resolve(), db_file.exists())
+    if str(db_file).startswith("/data/") and not os.access(db_file.parent, os.W_OK):
+        logging.critical("DATABASE_DIRECTORY_NOT_WRITABLE path=%s", db_file.parent)
+        raise RuntimeError("Папка /data недоступна для записи. Проверьте Railway Volume.")
     bot = Bot(token=BOT_TOKEN)
+    me = await bot.get_me()
+    logging.info("BOT_START bot_id=%s username=@%s pid=%s db=%s", me.id, me.username, os.getpid(), db_file.resolve())
     asyncio.create_task(abandoned_cart_reminder_loop(bot))
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, handle_signals=False)
 
 if __name__ == "__main__":
     asyncio.run(main())
