@@ -58,6 +58,10 @@ MAIN_MENU = ReplyKeyboardMarkup(
 def norm(value):
     return " ".join(str(value or "").strip().lower().replace("ё", "е").split())
 
+MENU_TEXTS = {norm(x) for x in ["🍃 Выбрать чай", "🔎 Поиск чая", "🛒 Корзина", "👤 Профиль", "❤️ Избранное", "📦 Мои заказы", "🎁 Бонусы", "🏷 Промокод", "💬 Поддержка"]}
+def is_menu_text(message):
+    return bool(message and message.text and norm(message.text) in MENU_TEXTS)
+
 def get_col(row, *names):
     normalized = {norm(k): v for k, v in row.items() if k is not None}
     for name in names:
@@ -438,7 +442,7 @@ async def search_start(message: Message):
         con.execute("INSERT INTO search_sessions(user_id, query) VALUES (?, '') ON CONFLICT(user_id) DO UPDATE SET query=''", (message.from_user.id,))
     await message.answer("Напиши название чая или часть названия. Например: габа, Ворон, Да Хун Пао.")
 
-@dp.message(lambda message: bool(message.from_user) and search_is_waiting(message.from_user.id))
+@dp.message(lambda message: bool(message.from_user) and not is_menu_text(message) and search_is_waiting(message.from_user.id))
 async def search_receive(message: Message):
     query = (message.text or "").strip()
     if not query:
@@ -589,17 +593,16 @@ async def add_to_cart(callback: CallbackQuery):
         con.execute("""INSERT INTO cart_reminders(user_id, changed_at, reminded) VALUES (?, ?, 0)
             ON CONFLICT(user_id) DO UPDATE SET changed_at=excluded.changed_at, reminded=0""",
             (callback.from_user.id, __import__('time').time()))
-    await callback.answer("Добавлено в корзину 🛒")
+    open_cart = InlineKeyboardBuilder()
+    open_cart.button(text="🛒 Открыть корзину", callback_data="cart:open")
+    await callback.message.answer("Добавлено в корзину 🛒", reply_markup=open_cart.as_markup())
+    await callback.answer("Добавлено")
 
-@dp.message(F.text == "🛒 Корзина")
-async def show_cart(message: Message):
+async def send_cart_view(target, user_id):
     with sqlite3.connect(DB_PATH) as con:
-        rows = con.execute(
-            "SELECT product_id, quantity FROM cart WHERE user_id = ?",
-            (message.from_user.id,),
-        ).fetchall()
+        rows = con.execute("SELECT product_id, quantity FROM cart WHERE user_id = ?", (user_id,)).fetchall()
     if not rows:
-        await message.answer("Корзина пока пуста. Нажми «🍃 Выбрать чай», чтобы добавить товары.")
+        await target.answer("Корзина пока пуста. Нажми «🍃 Выбрать чай», чтобы добавить товары.")
         return
     catalog = {str(p["id"]): p for p in all_visible_products()}
     lines, subtotal_total = [], 0
@@ -612,13 +615,25 @@ async def show_cart(message: Message):
         subtotal_total += subtotal
         lines.append(f"• {escape(p['name'])} × {quantity} — {subtotal} ₽")
         builder.button(text=f"Убрать: {p['name']}"[:64], callback_data=f"remove:{product_id}")
+    if not lines:
+        await target.answer("В корзине больше нет доступных позиций. Вернись в каталог и добавь чай заново.")
+        return
     builder.button(text="✅ Оформить заказ", callback_data="checkout:begin")
     builder.adjust(1)
-    total, discount_percent, discount_amount = price_with_discount(message.from_user.id, subtotal_total)
+    total, discount_percent, discount_amount = price_with_discount(user_id, subtotal_total)
     if discount_percent:
         lines.append(f"\nСкидка клиента ({discount_percent}%): −{discount_amount} ₽")
     lines.append(f"\n<b>Итого: {total} ₽</b>")
-    await message.answer("\n".join(lines), reply_markup=builder.as_markup(), parse_mode="HTML")
+    await target.answer("\n".join(lines), reply_markup=builder.as_markup(), parse_mode="HTML")
+
+@dp.message(lambda message: bool(message.from_user) and message.text and "корзина" in norm(message.text))
+async def show_cart(message: Message):
+    await send_cart_view(message, message.from_user.id)
+
+@dp.callback_query(F.data == "cart:open")
+async def open_cart_callback(callback: CallbackQuery):
+    await send_cart_view(callback.message, callback.from_user.id)
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("remove:"))
 async def remove_from_cart(callback: CallbackQuery):
@@ -757,7 +772,7 @@ async def admin_confirm_order(callback: CallbackQuery):
     await callback.answer("Заказ подтверждён")
     await callback.message.answer(f"✅ Заказ №{order_id} подтверждён. Клиенту отправлено уведомление.")
 
-@dp.message(lambda message: bool(message.from_user) and checkout_step(message.from_user.id) is not None)
+@dp.message(lambda message: bool(message.from_user) and not is_menu_text(message) and checkout_step(message.from_user.id) is not None)
 async def checkout_text_step(message: Message):
     user_id = message.from_user.id
     text = (message.text or "").strip()
@@ -846,7 +861,7 @@ async def promo_prompt(message: Message):
         con.execute("UPDATE users SET promo_waiting=1 WHERE user_id=?", (message.from_user.id,))
     await message.answer("Отправь промокод одним сообщением. Чтобы убрать действующий промокод, напиши СБРОС.")
 
-@dp.message(lambda message: bool(message.from_user) and promo_is_waiting(message.from_user.id))
+@dp.message(lambda message: bool(message.from_user) and not is_menu_text(message) and promo_is_waiting(message.from_user.id))
 async def promo_apply(message: Message):
     user_id = message.from_user.id
     code = (message.text or "").strip().upper()
