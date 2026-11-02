@@ -1226,10 +1226,16 @@ async def admin_discount(message: Message):
         return
 
     with db_connect() as con:
-        cur = con.execute("UPDATE users SET personal_discount=? WHERE user_id=?", (percent, user_id))
-        if cur.rowcount == 0:
-            await message.answer(f"Клиент с ID {user_id} не найден в базе.")
-            return
+        # Если клиент уже оформил заказ, но его строка в users отсутствует,
+        # создаём её по Telegram ID из уведомления о заказе.
+        con.execute(
+            "INSERT OR IGNORE INTO users(user_id) VALUES (?)",
+            (user_id,),
+        )
+        con.execute(
+            "UPDATE users SET personal_discount=? WHERE user_id=?",
+            (percent, user_id),
+        )
 
     await message.answer(
         f"✅ Персональная скидка для клиента <code>{user_id}</code> установлена: {percent}%.",
