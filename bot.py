@@ -713,7 +713,9 @@ async def checkout_confirm(callback: CallbackQuery):
                 telegram_link = f"<a href=\"tg://user?id={user_id}\">Открыть профиль покупателя</a>"
                 contact_url = f"tg://user?id={user_id}"
             admin_keyboard = InlineKeyboardBuilder()
+            admin_keyboard.button(text="✅ Подтвердить заказ", callback_data=f"admin_order:confirm:{order_id}")
             admin_keyboard.button(text="✉️ Написать покупателю", url=contact_url)
+            admin_keyboard.adjust(1)
             await callback.bot.send_message(
                 int(ADMIN_CHAT_ID),
                 f"🛎 <b>Новый заказ №{order_id}</b>\n\n{item_lines}{discount_line}\n\n<b>Итого: {total} ₽</b>\n\n"
@@ -726,6 +728,34 @@ async def checkout_confirm(callback: CallbackQuery):
         except Exception:
             logging.exception("Не удалось отправить заказ владельцу")
     await callback.answer("Заказ оформлен")
+
+@dp.callback_query(F.data.startswith("admin_order:confirm:"))
+async def admin_confirm_order(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != int(ADMIN_CHAT_ID or 0):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        order_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный номер заказа", show_alert=True)
+        return
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT user_id, status FROM orders WHERE id=?", (order_id,)).fetchone()
+        if not row:
+            await callback.answer("Заказ не найден", show_alert=True)
+            return
+        user_id, status = row
+        if status != "Новый":
+            await callback.answer(f"Статус заказа: {status}", show_alert=True)
+            return
+        con.execute("UPDATE orders SET status='Подтверждён' WHERE id=?", (order_id,))
+    try:
+        await callback.bot.send_message(user_id, f"✅ Ваш заказ №{order_id} подтверждён! Скоро свяжемся с вами для согласования деталей.")
+    except Exception:
+        logging.exception("Не удалось уведомить клиента о подтверждении заказа №%s", order_id)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Заказ подтверждён")
+    await callback.message.answer(f"✅ Заказ №{order_id} подтверждён. Клиенту отправлено уведомление.")
 
 @dp.message(lambda message: bool(message.from_user) and checkout_step(message.from_user.id) is not None)
 async def checkout_text_step(message: Message):
@@ -988,65 +1018,6 @@ async def bonuses(message: Message):
 @dp.message(F.text == "💬 Поддержка")
 async def support(message: Message):
     await message.answer("Напиши сюда свой вопрос — сообщение увидим в этом чате. Для быстрого заказа можно также написать в Telegram-магазин.")
-
-def admin_menu_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📦 Наличие товаров", callback_data="admin:stock")
-    builder.button(text="🎁 Персональная скидка", callback_data="admin:discount_help")
-    builder.button(text="👤 Информация о клиенте", callback_data="admin:client_help")
-    builder.adjust(1)
-    return builder.as_markup()
-
-
-@dp.message(Command("admin"))
-async def admin_menu(message: Message):
-    if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0):
-        return
-    await message.answer("🔐 <b>Панель администратора</b>\nВыбери действие:",
-                         parse_mode="HTML", reply_markup=admin_menu_keyboard())
-
-
-@dp.callback_query(F.data == "admin:stock")
-async def admin_menu_stock(callback: CallbackQuery):
-    if not callback.from_user or callback.from_user.id != int(ADMIN_CHAT_ID or 0):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    await callback.answer()
-    products = all_visible_products()
-    if not products:
-        await callback.message.answer("Каталог пуст.")
-        return
-    await callback.message.answer("📦 <b>Управление наличием</b>\nНажми на товар, чтобы изменить статус:", parse_mode="HTML")
-    for product in products:
-        status = "✅ В наличии" if product["available"] else "❌ Нет в наличии"
-        builder = InlineKeyboardBuilder()
-        builder.button(text=f"{status} · {product['name']}"[:64], callback_data=f"stock:toggle:{product['id']}")
-        await callback.message.answer(f"<b>{escape(product['name'])}</b> · {product['price']} ₽",
-                                      parse_mode="HTML", reply_markup=builder.as_markup())
-
-
-@dp.callback_query(F.data == "admin:discount_help")
-async def admin_menu_discount_help(callback: CallbackQuery):
-    if not callback.from_user or callback.from_user.id != int(ADMIN_CHAT_ID or 0):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    await callback.answer()
-    await callback.message.answer(
-        "🎁 <b>Персональная скидка</b>\nКоманда: <code>/discount TELEGRAM_ID ПРОЦЕНТ</code>\n"
-        "Пример: <code>/discount 123456789 10</code>\n"
-        "Чтобы снять скидку: укажи 0%. Максимум — 50%.", parse_mode="HTML")
-
-
-@dp.callback_query(F.data == "admin:client_help")
-async def admin_menu_client_help(callback: CallbackQuery):
-    if not callback.from_user or callback.from_user.id != int(ADMIN_CHAT_ID or 0):
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    await callback.answer()
-    await callback.message.answer(
-        "👤 <b>Информация о клиенте</b>\nКоманда: <code>/client TELEGRAM_ID</code>\n"
-        "Пример: <code>/client 123456789</code>", parse_mode="HTML")
-
 
 @dp.message(Command("stock"))
 async def admin_stock(message: Message):
