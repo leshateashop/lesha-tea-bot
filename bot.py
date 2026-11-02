@@ -1093,7 +1093,7 @@ async def admin_panel_action(callback: CallbackQuery):
     elif action == "help":
         await callback.message.answer(
             "Команды администратора:\n/stock — наличие товаров\n/client TELEGRAM_ID — карточка клиента\n"
-            "/discount ID или @username ПРОЦЕНТ — скидка (0 снимает)\n"
+            "/discount TELEGRAM_ID ПРОЦЕНТ — скидка (0 снимает)\n"
             "/promo_create КОД ПРОЦЕНТ [ЛИМИТ] — создать промокод\n"
             "/promo_list — список промокодов\n/promo_off КОД — отключить промокод\n"
             "/order_done НОМЕР — завершить заказ и начислить покупку"
@@ -1182,76 +1182,65 @@ async def admin_discount(message: Message):
     if len(parts) != 3 or not parts[2].isdigit():
         await message.answer(
             "Использование:\n"
-            "/discount TELEGRAM_ID ПРОЦЕНТ\n"
-            "/discount @username ПРОЦЕНТ\n"
-            "/discount https://t.me/username ПРОЦЕНТ\n"
-            "Например: /discount @tiran124z 30"
+            "/discount @username 30\n"
+            "/discount https://t.me/username 30\n"
+            "/discount TELEGRAM_ID 30\n"
+            "0 — снять персональную скидку."
         )
         return
 
-    target = parts[1].strip()
-    percent = int(parts[2])
+    target, percent_text = parts[1], parts[2]
+    percent = int(percent_text)
     if percent > 50:
         await message.answer("Для безопасности скидка не может превышать 50%.")
         return
 
-    # Принимаем числовой ID, @username или обычную ссылку t.me/username.
     user_id = None
     if target.isdigit():
         user_id = int(target)
     else:
-        username = target
-        if username.startswith("https://t.me/"):
-            username = username[len("https://t.me/"):]
-        elif username.startswith("http://t.me/"):
-            username = username[len("http://t.me/"):]
-        elif username.startswith("t.me/"):
-            username = username[len("t.me/"):]
-        username = username.split("?", 1)[0].strip("/").lstrip("@")
-
-        # Ссылки-приглашения и специальные ссылки не являются username.
+        # Принимаем @username, t.me/username и https://t.me/username.
+        username = target.strip().rstrip("/")
+        username = username.split("?")[0]
+        if "t.me/" in username.lower():
+            username = username[username.lower().rfind("t.me/") + 5:]
+        username = username.lstrip("@").strip()
+        # Ссылки-приглашения и ссылки на посты не являются username.
         if not username or "/" in username or username.startswith("+"):
-            await message.answer("Не удалось распознать ссылку. Используй @username или https://t.me/username.")
+            await message.answer("Не понял username. Пришли @username или числовой Telegram ID.")
             return
-
         with db_connect() as con:
             row = con.execute(
-                "SELECT user_id FROM users WHERE lower(username)=lower(?) LIMIT 1",
+                "SELECT user_id FROM users WHERE lower(ltrim(username, '@')) = lower(?) LIMIT 1",
                 (username,),
             ).fetchone()
         if row:
             user_id = int(row[0])
-        else:
-            await message.answer(
-                f"Клиент @{escape(username)} не найден в базе бота. "
-                "Он должен хотя бы один раз запустить бота командой /start."
-            )
-            return
+
+    if user_id is None:
+        await message.answer(
+            f"Клиент {escape(target)} не найден в базе этой версии бота.\n"
+            "Если он оформлял заказ, возможно, заказ и текущая база находятся в разных хранилищах. "
+            "Проверь числовой ID клиента в старом заказе командой /client ID."
+        )
+        return
 
     with db_connect() as con:
-        cur = con.execute(
-            "UPDATE users SET personal_discount=? WHERE user_id=?",
-            (percent, user_id),
-        )
+        cur = con.execute("UPDATE users SET personal_discount=? WHERE user_id=?", (percent, user_id))
         if cur.rowcount == 0:
-            await message.answer("Клиент не найден. Попроси его нажать /start в боте.")
+            await message.answer(f"Клиент с ID {user_id} не найден в базе.")
             return
-        row = con.execute(
-            "SELECT username, first_name FROM users WHERE user_id=?",
-            (user_id,),
-        ).fetchone()
 
-    display_name = f"@{row[0]}" if row and row[0] else (row[1] if row and row[1] else str(user_id))
-    if percent == 0:
-        result_text = f"✅ Персональная скидка для {escape(display_name)} снята."
-        client_text = "Ваша персональная скидка в «Чайной лавке дяди Лёши» отменена."
-    else:
-        result_text = f"✅ Для {escape(display_name)} установлена персональная скидка {percent}%."
-        client_text = f"🎁 Для вас установлена персональная скидка {percent}% в «Чайной лавке дяди Лёши»."
-
-    await message.answer(result_text, parse_mode="HTML")
+    await message.answer(
+        f"✅ Персональная скидка для клиента <code>{user_id}</code> установлена: {percent}%.",
+        parse_mode="HTML",
+    )
     try:
-        await message.bot.send_message(user_id, client_text)
+        await message.bot.send_message(
+            user_id,
+            f"🎁 Для вас установлена персональная скидка {percent}% в «Чайной лавке дяди Лёши»." if percent else
+            "Персональная скидка в «Чайной лавке дяди Лёши» отменена.",
+        )
     except Exception:
         logging.info("Не удалось уведомить клиента %s об изменении скидки", user_id)
 
