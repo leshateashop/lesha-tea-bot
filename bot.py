@@ -1019,6 +1019,53 @@ async def bonuses(message: Message):
 async def support(message: Message):
     await message.answer("Напиши сюда свой вопрос — сообщение увидим в этом чате. Для быстрого заказа можно также написать в Telegram-магазин.")
 
+@dp.message(Command("admin"))
+async def admin_panel(message: Message):
+    # Команда доступна только владельцу, остальные пользователи её не видят.
+    if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0):
+        return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📦 Управление наличием", callback_data="admin:stock")
+    builder.button(text="🎟 Промокоды", callback_data="admin:promos")
+    builder.button(text="ℹ️ Все команды", callback_data="admin:help")
+    builder.adjust(1)
+    await message.answer(
+        "🔐 <b>Панель администратора</b>\nВыбери раздел:",
+        reply_markup=builder.as_markup(), parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data.startswith("admin:"))
+async def admin_panel_action(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != int(ADMIN_CHAT_ID or 0):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    action = callback.data.split(":", 1)[1]
+    if action == "stock":
+        products = all_visible_products()
+        if not products:
+            await callback.message.answer("Каталог пуст.")
+        else:
+            await callback.message.answer("📦 <b>Управление наличием</b>\nНажми на товар, чтобы изменить статус:", parse_mode="HTML")
+            for product in products:
+                status = "✅ В наличии" if product["available"] else "❌ Нет в наличии"
+                kb = InlineKeyboardBuilder()
+                kb.button(text=f"{status} · {product['name']}"[:64], callback_data=f"stock:toggle:{product['id']}")
+                await callback.message.answer(f"<b>{escape(product['name'])}</b> · {product['price']} ₽", parse_mode="HTML", reply_markup=kb.as_markup())
+    elif action == "promos":
+        await callback.message.answer(
+            "🎟 <b>Промокоды</b>\nСоздать: /promo_create КОД ПРОЦЕНТ [ЛИМИТ]\n"
+            "Список: /promo_list\nОтключить: /promo_off КОД", parse_mode="HTML"
+        )
+    elif action == "help":
+        await callback.message.answer(
+            "Команды администратора:\n/stock — наличие товаров\n/client TELEGRAM_ID — карточка клиента\n"
+            "/discount TELEGRAM_ID ПРОЦЕНТ — скидка (0 снимает)\n"
+            "/promo_create КОД ПРОЦЕНТ [ЛИМИТ] — создать промокод\n"
+            "/promo_list — список промокодов\n/promo_off КОД — отключить промокод\n"
+            "/order_done НОМЕР — завершить заказ и начислить покупку"
+        )
+    await callback.answer()
+
 @dp.message(Command("stock"))
 async def admin_stock(message: Message):
     if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0):
