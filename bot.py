@@ -1405,10 +1405,10 @@ async def review_reject(callback: CallbackQuery):
     await callback.answer()
 
 @dp.message(Command("catalog"))
-async def catalog_count(message: Message):
-    products = all_visible_products()
-    available = sum(1 for p in products if p["available"])
-    await message.answer(f"Каталог загружен: {len(products)} позиций, в наличии: {available}.")
+async def catalog_command(message: Message):
+    # Команда /catalog должна открывать тот же список категорий,
+    # что и кнопка «🍃 Выбрать чай».
+    await message.answer("Выбери категорию:", reply_markup=category_keyboard())
 
 @dp.message()
 async def fallback(message: Message):
