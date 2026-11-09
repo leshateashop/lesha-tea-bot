@@ -1213,7 +1213,10 @@ async def admin_panel_action(callback: CallbackQuery):
         await callback.answer("Нет доступа", show_alert=True)
         return
     action = callback.data.split(":", 1)[1]
-    if action == "stock":
+    if action == "add_product":
+        ADMIN_ADD_STATES[callback.from_user.id] = {"step": "name"}
+        await callback.message.answer("➕ Добавление товара\n\n1/6. Напиши название товара:")
+    elif action == "stock":
         products = all_visible_products()
         if not products:
             await callback.message.answer("Каталог пуст.")
