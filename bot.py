@@ -1053,12 +1053,151 @@ async def bonuses(message: Message):
 async def support(message: Message):
     await message.answer("Напиши сюда свой вопрос — сообщение увидим в этом чате. Для быстрого заказа можно также написать в Telegram-магазин.")
 
+# Пошаговое добавление товара владельцем прямо в Telegram.
+ADMIN_ADD_STATES = {}
+
+
+def save_new_product_to_csv(product):
+    path = Path(CATALOG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["id", "category", "name", "price", "weight", "available", "show", "description", "photo"]
+    rows = []
+    if path.exists():
+        for encoding in ("utf-8-sig", "cp1251"):
+            try:
+                with path.open("r", encoding=encoding, newline="") as f:
+                    sample = f.read(4096)
+                    f.seek(0)
+                    try:
+                        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+                    except csv.Error:
+                        dialect = csv.excel
+                    reader = csv.DictReader(f, dialect=dialect)
+                    old_fields = reader.fieldnames or fields
+                    rows = list(reader)
+                fields = old_fields
+                break
+            except UnicodeDecodeError:
+                continue
+    if any(str(row.get("id", "")) == str(product["id"]) for row in rows):
+        raise ValueError("Товар с таким ID уже существует")
+    rows.append(product)
+    # Перезаписываем целиком атомарно, сохраняя все прежние позиции.
+    import tempfile
+    fd, temp_name = tempfile.mkstemp(prefix="catalog_", suffix=".csv", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+@dp.callback_query(F.data == "admin:add_product")
+async def admin_add_product_start(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != int(ADMIN_CHAT_ID or 0):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    ADMIN_ADD_STATES[callback.from_user.id] = {"step": "name"}
+    await callback.message.answer("➕ Добавление товара\n\n1/6. Напиши название товара:")
+    await callback.answer()
+
+
+@dp.message(lambda m: bool(m.from_user and m.from_user.id in ADMIN_ADD_STATES))
+async def admin_add_product_step(message: Message):
+    if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0):
+        return
+    state = ADMIN_ADD_STATES.get(message.from_user.id)
+    if not state:
+        return
+    step = state["step"]
+    if message.text and message.text.strip().lower() in {"отмена", "/cancel"}:
+        ADMIN_ADD_STATES.pop(message.from_user.id, None)
+        await message.answer("Добавление товара отменено.")
+        return
+    if step == "photo":
+        if message.text and message.text.strip().lower() == "пропустить":
+            state["photo"] = ""
+            state["step"] = "finish"
+        elif message.photo:
+            state["photo"] = message.photo[-1].file_id
+            state["step"] = "finish"
+        else:
+            await message.answer("Пришли фотографию товара одним сообщением или напиши «пропустить».")
+            return
+    else:
+        value = (message.text or "").strip()
+        if not value:
+            await message.answer("Отправь текстом, пожалуйста.")
+            return
+        if step == "name":
+            state["name"] = value
+            state["step"] = "category"
+            await message.answer("2/6. Категория (например: Габа, Улуны, Шу пуэр):")
+            return
+        if step == "category":
+            state["category"] = value
+            state["step"] = "price"
+            await message.answer("3/6. Цена в рублях (только число):")
+            return
+        if step == "price":
+            try:
+                price = int(float(value.replace(" ", "").replace(",", ".")))
+                if price <= 0:
+                    raise ValueError
+            except ValueError:
+                await message.answer("Нужна положительная цена числом, например 1250.")
+                return
+            state["price"] = price
+            state["step"] = "weight"
+            await message.answer("4/6. Вес / фасовка (например: 50 г):")
+            return
+        if step == "weight":
+            state["weight"] = value
+            state["step"] = "description"
+            await message.answer("5/6. Описание товара:")
+            return
+        if step == "description":
+            state["description"] = value
+            state["step"] = "photo"
+            await message.answer("6/6. Пришли фотографию товара (или напиши «пропустить»):")
+            return
+    if state.get("step") == "finish":
+        import re
+        base = re.sub(r"[^a-z0-9]+", "_", state["name"].lower()).strip("_")
+        product_id = (base[:32] or "product")
+        product_id = f"{product_id}_{__import__('time').strftime('%y%m%d%H%M%S')}"
+        product = {
+            "id": product_id, "category": state["category"], "name": state["name"],
+            "price": state["price"], "weight": state["weight"], "available": "yes",
+            "show": "yes", "description": state["description"], "photo": state.get("photo", ""),
+        }
+        try:
+            save_new_product_to_csv(product)
+        except Exception as exc:
+            logging.exception("Не удалось добавить товар в каталог")
+            await message.answer(f"Не удалось сохранить товар: {escape(str(exc))}. Попробуй ещё раз или напиши /cancel.")
+            return
+        ADMIN_ADD_STATES.pop(message.from_user.id, None)
+        await message.answer(
+            f"✅ Товар добавлен в каталог!\n\n<b>{escape(product['name'])}</b>\n"
+            f"Категория: {escape(product['category'])}\nЦена: {product['price']} ₽\n"
+            f"Вес: {escape(product['weight'])}\nФото: {'добавлено' if product['photo'] else 'нет'}\n\n"
+            "Каталог сохранён на диске сервера. Для сохранения после перезапуска Railway каталог должен находиться на постоянном Volume.",
+            parse_mode="HTML"
+        )
+
+
 @dp.message(Command("admin"))
 async def admin_panel(message: Message):
     # Команда доступна только владельцу, остальные пользователи её не видят.
     if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0):
         return
     builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Добавить товар", callback_data="admin:add_product")
     builder.button(text="📦 Управление наличием", callback_data="admin:stock")
     builder.button(text="🎟 Промокоды", callback_data="admin:promos")
     builder.button(text="ℹ️ Все команды", callback_data="admin:help")
