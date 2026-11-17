@@ -174,7 +174,8 @@ def init_db():
                 total_spent INTEGER NOT NULL DEFAULT 0,
                 personal_discount INTEGER NOT NULL DEFAULT 0,
                 bonus_balance INTEGER NOT NULL DEFAULT 0,
-                active_promo TEXT NOT NULL DEFAULT '', promo_waiting INTEGER NOT NULL DEFAULT 0
+                active_promo TEXT NOT NULL DEFAULT '', promo_waiting INTEGER NOT NULL DEFAULT 0,
+                marketing_opt_in INTEGER NOT NULL DEFAULT 0
             )
         """)
         con.execute("""
@@ -245,6 +246,7 @@ def init_db():
             ("users", "bonus_balance", "INTEGER NOT NULL DEFAULT 0"),
             ("users", "active_promo", "TEXT NOT NULL DEFAULT ''"),
             ("users", "promo_waiting", "INTEGER NOT NULL DEFAULT 0"),
+            ("users", "marketing_opt_in", "INTEGER NOT NULL DEFAULT 0"),
             ("orders", "subtotal", "INTEGER NOT NULL DEFAULT 0"),
             ("orders", "discount_percent", "INTEGER NOT NULL DEFAULT 0"),
             ("orders", "discount_amount", "INTEGER NOT NULL DEFAULT 0"),
@@ -359,6 +361,44 @@ def find_product(product_id):
             return p
     return None
 
+def marketing_consent_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подписаться на новости и акции", callback_data="marketing:yes")
+    builder.button(text="Не подписываться", callback_data="marketing:no")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+@dp.callback_query(F.data.startswith("marketing:"))
+async def marketing_consent(callback: CallbackQuery):
+    if not callback.from_user:
+        await callback.answer()
+        return
+    enabled = callback.data.endswith(":yes")
+    with db_connect() as con:
+        con.execute(
+            "INSERT INTO users(user_id, username, first_name, marketing_opt_in) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name, marketing_opt_in=excluded.marketing_opt_in",
+            (callback.from_user.id, callback.from_user.username, callback.from_user.first_name, 1 if enabled else 0),
+        )
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("✅ Вы подписались на новости и акции." if enabled else "Хорошо, рекламные сообщения отправляться не будут.")
+    await callback.answer()
+
+
+@dp.message(Command("subscribe"))
+async def marketing_subscribe(message: Message):
+    await message.answer("Хотите получать новости, новинки и акции чайной лавки?", reply_markup=marketing_consent_keyboard())
+
+
+@dp.message(Command("unsubscribe"))
+async def marketing_unsubscribe(message: Message):
+    if message.from_user:
+        with db_connect() as con:
+            con.execute("UPDATE users SET marketing_opt_in=0 WHERE user_id=?", (message.from_user.id,))
+    await message.answer("Вы отписаны от новостей и акций. Вернуться можно командой /subscribe.")
+
+
 @dp.message(CommandStart())
 async def start(message: Message):
     with db_connect() as con:
@@ -373,6 +413,11 @@ async def start(message: Message):
         "Выбирай чай, собирай корзину и оформляй заказ прямо здесь.",
         reply_markup=MAIN_MENU,
         parse_mode="HTML",
+    )
+    await message.answer(
+        "Хотите получать новости, новые поступления и специальные предложения? "
+        "Отписаться в любой момент можно командой /unsubscribe.",
+        reply_markup=marketing_consent_keyboard(),
     )
 
 @dp.message(F.text == "🍃 Выбрать чай")
@@ -1114,9 +1159,18 @@ async def admin_add_product_step(message: Message):
     if not state:
         return
     step = state["step"]
-    if message.text and message.text.strip().lower() in {"отмена", "/cancel"}:
+    cancel_text = (message.text or "").strip().casefold()
+    if cancel_text in {"отмена", "/cancel", "сброс", "/reset", "/admin"}:
         ADMIN_ADD_STATES.pop(message.from_user.id, None)
         await message.answer("Добавление товара отменено.")
+        if cancel_text == "/admin":
+            builder = InlineKeyboardBuilder()
+            builder.button(text="➕ Добавить товар", callback_data="admin:add_product")
+            builder.button(text="📦 Управление наличием", callback_data="admin:stock")
+            builder.button(text="🎟 Промокоды", callback_data="admin:promos")
+            builder.button(text="ℹ️ Все команды", callback_data="admin:help")
+            builder.adjust(1)
+            await message.answer("🔐 <b>Панель администратора</b>\nВыбери раздел:", reply_markup=builder.as_markup(), parse_mode="HTML")
         return
     if step == "photo":
         if message.text and message.text.strip().lower() == "пропустить":
@@ -1191,6 +1245,43 @@ async def admin_add_product_step(message: Message):
         )
 
 
+BROADCAST_WAITING = set()
+
+
+@dp.message(Command("broadcast"))
+async def admin_broadcast_start(message: Message):
+    if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0):
+        return
+    BROADCAST_WAITING.add(message.from_user.id)
+    await message.answer("✉️ Пришли одним сообщением текст или фотографию с подписью для рассылки подписчикам. Для отмены напиши /cancel.")
+
+
+@dp.message(lambda m: bool(m.from_user and m.from_user.id in BROADCAST_WAITING))
+async def admin_broadcast_send(message: Message):
+    if not message.from_user or message.from_user.id != int(ADMIN_CHAT_ID or 0):
+        return
+    if (message.text or "").strip().lower() in {"/cancel", "отмена", "сброс"}:
+        BROADCAST_WAITING.discard(message.from_user.id)
+        await message.answer("Рассылка отменена.")
+        return
+    if not message.text and not message.photo:
+        await message.answer("Отправь текст или фотографию с подписью; для отмены /cancel.")
+        return
+    BROADCAST_WAITING.discard(message.from_user.id)
+    with db_connect() as con:
+        recipients = [row[0] for row in con.execute("SELECT user_id FROM users WHERE marketing_opt_in=1").fetchall()]
+    sent = failed = 0
+    for user_id in recipients:
+        try:
+            await message.bot.copy_message(chat_id=user_id, from_chat_id=message.chat.id, message_id=message.message_id)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception as exc:
+            failed += 1
+            logging.info("Broadcast failed user_id=%s error=%s", user_id, exc)
+    await message.answer(f"Рассылка завершена. Отправлено: {sent}; не доставлено: {failed}; подписчиков: {len(recipients)}.")
+
+
 @dp.message(Command("admin"))
 async def admin_panel(message: Message):
     # Команда доступна только владельцу, остальные пользователи её не видят.
@@ -1200,6 +1291,7 @@ async def admin_panel(message: Message):
     builder.button(text="➕ Добавить товар", callback_data="admin:add_product")
     builder.button(text="📦 Управление наличием", callback_data="admin:stock")
     builder.button(text="🎟 Промокоды", callback_data="admin:promos")
+    builder.button(text="✉️ Рассылка", callback_data="admin:broadcast")
     builder.button(text="ℹ️ Все команды", callback_data="admin:help")
     builder.adjust(1)
     await message.answer(
@@ -1227,6 +1319,10 @@ async def admin_panel_action(callback: CallbackQuery):
                 kb = InlineKeyboardBuilder()
                 kb.button(text=f"{status} · {product['name']}"[:64], callback_data=f"stock:toggle:{product['id']}")
                 await callback.message.answer(f"<b>{escape(product['name'])}</b> · {product['price']} ₽", parse_mode="HTML", reply_markup=kb.as_markup())
+    elif action == "broadcast":
+        with db_connect() as con:
+            count = con.execute("SELECT COUNT(*) FROM users WHERE marketing_opt_in=1").fetchone()[0]
+        await callback.message.answer(f"✉️ Подписчиков на новости и акции: {count}\nДля отправки: /broadcast")
     elif action == "promos":
         await callback.message.answer(
             "🎟 <b>Промокоды</b>\nСоздать: /promo_create КОД ПРОЦЕНТ [ЛИМИТ]\n"
