@@ -1292,6 +1292,7 @@ async def admin_panel(message: Message):
     builder.button(text="📦 Управление наличием", callback_data="admin:stock")
     builder.button(text="🎟 Промокоды", callback_data="admin:promos")
     builder.button(text="✉️ Рассылка", callback_data="admin:broadcast")
+    builder.button(text="👥 Подписчики рассылки", callback_data="admin:subscribers")
     builder.button(text="ℹ️ Все команды", callback_data="admin:help")
     builder.adjust(1)
     await message.answer(
@@ -1323,6 +1324,30 @@ async def admin_panel_action(callback: CallbackQuery):
         with db_connect() as con:
             count = con.execute("SELECT COUNT(*) FROM users WHERE marketing_opt_in=1").fetchone()[0]
         await callback.message.answer(f"✉️ Подписчиков на новости и акции: {count}\nДля отправки: /broadcast")
+    elif action == "subscribers":
+        with db_connect() as con:
+            rows = con.execute(
+                "SELECT user_id, username, first_name FROM users "
+                "WHERE marketing_opt_in=1 ORDER BY first_name COLLATE NOCASE, user_id"
+            ).fetchall()
+        if not rows:
+            await callback.message.answer("Пока нет подписчиков на рассылку.")
+        else:
+            await callback.message.answer(f"👥 Подписчиков на рассылку: {len(rows)}")
+            lines = []
+            for user_id, username, first_name in rows:
+                name = escape(first_name or "Без имени")
+                handle = f" · @{escape(username)}" if username else ""
+                lines.append(f"• {name}{handle} — <code>{user_id}</code>")
+            # Telegram ограничивает длину сообщения; отправляем список частями.
+            chunk = ""
+            for line in lines:
+                if len(chunk) + len(line) + 1 > 3500:
+                    await callback.message.answer(chunk, parse_mode="HTML")
+                    chunk = ""
+                chunk += line + "\n"
+            if chunk:
+                await callback.message.answer(chunk, parse_mode="HTML")
     elif action == "promos":
         await callback.message.answer(
             "🎟 <b>Промокоды</b>\nСоздать: /promo_create КОД ПРОЦЕНТ [ЛИМИТ]\n"
